@@ -51,43 +51,42 @@ You can extend it by dropping in a new `.so`. No need to recompile the core.
 ## High-level architecture
 
 ```text
-                -+
+                +----------------------+
                 |      ph-cli          |
                 | (control / monitor)  |
-                -+
+                +----------------------+
                            |
                            |  Unix Domain Socket
                            v
-                  +
+                  +------------------+
                   |     ph-core      |
                   |  (the broker)    |
-                  +
+                  +------------------+
                             |
-            --+
+            +-----------------------------------+
             |                                   |
-    --+                    +
+    +--------------+                    +---------------+
     |   soapy.so   |                    |   wfmd.so     |
     | RF source    |                    | WFM demod     |
     | (IQ out)     |                    | (Stereo PCM)  |
-    --+                    +
+    +--------------+                    +---------------+
             |                                   |
             |      shared memory buffers        |
             | file descriptors passed via UDS   |
-            |>|
+            |<--------------------------------->|
             |                                   |
             v                                   v
-        +           --+
+        +------------------+           +-----------------+
         | iq-feed          |           | audio-feed      |
-        +           --+
+        +------------------+           +-----------------+
                                                 |
                                                 v
-                                      +
+                                      +------------------+
                                       | audiosink.so     |
                                       | output / playback|
-                                      +
+                                      +------------------+
 
 ```
-
 
 There are 3 important concepts:
 
