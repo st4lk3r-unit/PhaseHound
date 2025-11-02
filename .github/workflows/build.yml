@@ -1,64 +1,119 @@
-name: PhaseHound manual build & test
+name: PhaseHound simple release
 
 on:
   workflow_dispatch:
+    inputs:
+      set_name:
+        description: 'Release name (optional). If empty → PhaseHound-unmarked-<sha7>'
+        required: false
+        type: string
+
+permissions:
+  contents: write
 
 jobs:
-  build-and-test:
+  build-and-release:
     runs-on: ubuntu-latest
 
+    env:
+      BUILD_DIR: dist
+
     steps:
-      - name: Checkout repo
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install build deps
+      - name: Install deps
         run: |
+          set -eux
           sudo apt-get update
-          # base toolchain
-          sudo apt-get install -y build-essential pkg-config
-          # optional SDR hw support
-          sudo apt-get install -y libsoapysdr-dev
-          # (when you add tests that exercise audio, if any deps are needed put them here)
+          sudo apt-get install -y build-essential pkg-config libsoapysdr-dev libasound2-dev
 
-      - name: Build (release profile)
+      - name: Build
         run: |
-          make clean
-          make -j$(nproc)
+          set -eux
+          make -j"$(nproc)"
 
-      - name: Run tests
+      - name: Assemble release skeleton
         run: |
-          # placeholder: adapt once you have ./tests or "make test"
-          if [ -f Makefile ] && grep -q "^test:" Makefile; then
-            make test
-          else
-            echo "No test target yet."
+          set -euo pipefail
+          rm -rf "$BUILD_DIR"
+          mkdir -p "$BUILD_DIR/addons"
+
+          # Pick up binaries (root or shallow dirs)
+          CORE_PATH="$(find . -maxdepth 2 -type f -name ph-core -perm -111 | head -n1 || true)"
+          CLI_PATH="$(find . -maxdepth 2 -type f -name ph-cli  -perm -111 | head -n1 || true)"
+          [ -n "${CORE_PATH:-}" ] && install -m 0755 "$CORE_PATH" "$BUILD_DIR/ph-core" || echo "WARN: ph-core not found"
+          [ -n "${CLI_PATH:-}"  ] && install -m 0755 "$CLI_PATH"  "$BUILD_DIR/ph-cli"  || echo "WARN: ph-cli not found"
+
+          # src/addons/<name>/*.so  →  ./addons/<name>/ph-lib<name>.so
+          if [ -d src/addons ]; then
+            for d in src/addons/*; do
+              [ -d "$d" ] || continue
+              name="$(basename "$d")"
+              so="$(find "$d" -maxdepth 1 -type f -name '*.so' | head -n1 || true)"
+              if [ -n "${so:-}" ]; then
+                mkdir -p "$BUILD_DIR/addons/$name"
+                cp "$so" "$BUILD_DIR/addons/$name/ph-lib${name}.so"
+              fi
+            done
           fi
 
-      - name: Build with sanitizers (debug profile)
+          echo "Release tree:"
+          find "$BUILD_DIR" -type f | sort
+
+      - name: Name release & archive
+        id: meta
         run: |
-          # this assumes you add an 'asan' target in your Makefile that enables:
-          #   -fsanitize=address,undefined -fno-omit-frame-pointer
-          # and rebuilds ph-core, ph-cli, and addons
-          if grep -q "^asan:" Makefile; then
-            make clean
-            make asan -j$(nproc)
-          else
-            echo "No asan target yet."
+          set -euo pipefail
+          shortsha="${GITHUB_SHA::7}"
+          REL_NAME="${{ inputs.set_name }}"
+          if [ -z "$REL_NAME" ]; then
+            REL_NAME="PhaseHound-unmarked-${shortsha}"
           fi
+          # internal tag (not an input) required by GitHub; keep it boring/unique
+          TAG="auto-${shortsha}"
+          ARCHIVE="phasehound-${shortsha}-linux-amd64.tar.gz"
 
-      - name: Package artifacts
+          echo "rel_name=$REL_NAME" >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG"           >> "$GITHUB_OUTPUT"
+          echo "archive=$ARCHIVE"   >> "$GITHUB_OUTPUT"
+
+          echo "REL_NAME=$REL_NAME" >> "$GITHUB_ENV"
+          echo "TAG=$TAG"           >> "$GITHUB_ENV"
+          echo "ARCHIVE=$ARCHIVE"   >> "$GITHUB_ENV"
+
+      - name: Package tarball (+ checksum)
         run: |
-          mkdir -p dist
-          # drop whatever is relevant
-          # adjust paths if different in your tree
-          cp ph-core ph-cli dist/ 2>/dev/null || true
-          cp src/addons/*/*.so dist/ 2>/dev/null || true
-          cp -r docs dist/docs 2>/dev/null || true
-          tar czf phasehound-artifacts.tar.gz dist
+          set -eux
+          tar -C "$BUILD_DIR" -czf "$ARCHIVE" .
+          sha256sum "$ARCHIVE" > "$ARCHIVE.sha256"
 
-      - name: Upload artifacts
+      - name: Upload CI artifact (optional)
         uses: actions/upload-artifact@v4
         with:
-          name: phasehound-build
-          path: phasehound-artifacts.tar.gz
-          if-no-files-found: warn
+          name: ${{ steps.meta.outputs.rel_name }}
+          path: |
+            ${{ env.ARCHIVE }}
+            ${{ env.ARCHIVE }}.sha256
+          retention-days: 7
+
+      - name: Publish GitHub Release (title only; no user-facing tag input)
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          # Create a lightweight tag silently (required by GitHub releases)
+          if ! git rev-parse "$TAG" >/dev/null 2>&1; then
+            git tag -a "$TAG" -m "CI release $REL_NAME"
+            git push origin "$TAG"
+          fi
+
+          # Create or update the release identified by the internal tag, with a pretty title
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            gh release create "$TAG" "$ARCHIVE" "$ARCHIVE.sha256" \
+              --title "$REL_NAME" \
+              --notes "Automated build and packaging."
+          else
+            gh release upload "$TAG" "$ARCHIVE" "$ARCHIVE.sha256" --clobber
+            gh release edit "$TAG" --title "$REL_NAME"
+          fi
