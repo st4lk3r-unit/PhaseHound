@@ -97,22 +97,21 @@ jobs:
             ${{ env.ARCHIVE }}.sha256
           retention-days: 7
 
-      - name: Publish GitHub Release (title only; no user-facing tag input)
+      - name: Publish GitHub Release (no local tagging)
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          # Create a lightweight tag silently (required by GitHub releases)
-          if ! git rev-parse "$TAG" >/dev/null 2>&1; then
-            git tag -a "$TAG" -m "CI release $REL_NAME"
-            git push origin "$TAG"
-          fi
-
-          # Create or update the release identified by the internal tag, with a pretty title
+          # Release title decided earlier into $REL_NAME, archive path in $ARCHIVE
+          shortsha="${GITHUB_SHA::7}"
+          TAG="auto-${shortsha}"
+      
+          # If the release doesn't exist, create it and point the tag at this commit
           if ! gh release view "$TAG" >/dev/null 2>&1; then
             gh release create "$TAG" "$ARCHIVE" "$ARCHIVE.sha256" \
               --title "$REL_NAME" \
-              --notes "Automated build and packaging."
+              --notes "Automated build and packaging." \
+              --target "$GITHUB_SHA"
           else
             gh release upload "$TAG" "$ARCHIVE" "$ARCHIVE.sha256" --clobber
             gh release edit "$TAG" --title "$REL_NAME"
