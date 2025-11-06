@@ -10,6 +10,7 @@ set -x
 ./ph-cli pub soapy.config.in "start"
 ./ph-cli pub audiosink.config.in "subscribe wfmd.audio-info"
 ./ph-cli pub wfmd.config.in "open"
+./ph-cli pub wfmd.config.in "start"
 ./ph-cli pub audiosink.config.in 'start'
 
 killall ph-cli

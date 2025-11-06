@@ -96,7 +96,8 @@ typedef struct {
 
 /* ---------- global state ---------- */
 static _Atomic int g_run = 0;
-static _Atomic bool g_active = true;  /* start/stop gating */
+/* start/stop gating — default to stopped for consistency with other addons */
+static _Atomic bool g_active = false;
 static const char *g_sock = NULL;
 static pthread_t   g_thr;
 static ph_ctrl_t   g_ctrl;         // control-plane ctx
@@ -486,6 +487,9 @@ static void demod_block(const float *iq, size_t nsamp, double fs_in){
 
 /* ---------- IQ ring drain ---------- */
 static void demod_from_iq_ring(void){
+    /* Do not read/advance the IQ ring when inactive: behave like a real stop. */
+    if (!atomic_load(&g_active)) return;
+
     phiq_hdr_t *h = g_iq.hdr;
     if(!h) return;
     const uint32_t cap = h->capacity;
@@ -522,7 +526,7 @@ static void demod_from_iq_ring(void){
     /* handle formats */
     if(h->fmt == PHIQ_FMT_CF32){
         float *f = (float*)tmp;          // interleaved I,Q float32
-        if(atomic_load(&g_active)) demod_block((const float*)f, nsamp, fs);
+        demod_block((const float*)f, nsamp, fs);
     }else if(h->fmt == PHIQ_FMT_CS16){
         /* convert to float interleaved */
         size_t need = nsamp * 2;
@@ -533,7 +537,7 @@ static void demod_from_iq_ring(void){
             g_wb.tmp_f[2*i+0] = (float)s[2*i+0] * scale;
             g_wb.tmp_f[2*i+1] = (float)s[2*i+1] * scale;
         }
-        if(atomic_load(&g_active)) demod_block((const float*)g_wb.tmp_f, nsamp, fs);
+        demod_block((const float*)g_wb.tmp_f, nsamp, fs);
     }else{
         // unknown format; drop
     }
@@ -655,12 +659,9 @@ static void *run(void *arg){
     char js[POC_MAX_JSON];
 
     while(atomic_load(&g_run)){
-        /* drain IQ aggressively when active */
-        if(atomic_load(&g_active)){
-            for(int k=0;k<8;k++) demod_from_iq_ring();
-        }else{
-            /* still advance read pointer to avoid unbounded growth */
-            demod_from_iq_ring();
+        /* Only demod/drain when active */
+        if (atomic_load(&g_active)) {
+            for (int k = 0; k < 8; k++) demod_from_iq_ring();
         }
 
         int infd=-1; size_t nfds=1;
