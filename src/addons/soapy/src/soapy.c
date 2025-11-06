@@ -1,328 +1,312 @@
-#define _GNU_SOURCE
-#include "ph_uds_protocol.h"
-#include "plugin.h"
-#include "common.h"
+// soapy.c — SoapySDR IQ producer (unified control-plane ABI + absolute ring counters)
+// Uses ctrlmsg helpers: ph_ctrl_init/adverise + ph_ctrl_dispatch; produces soapy.IQ-info (memfd)
 
+#define _GNU_SOURCE
+#include <unistd.h>
+#include <sys/syscall.h>
+#include <sys/mman.h>
+#include <sys/uio.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+
+#include <stdatomic.h>
+#include <pthread.h>
+#include <errno.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <errno.h>
-#include <pthread.h>
-#include <unistd.h>
-#include <fcntl.h>
-#include <sys/mman.h>
-#include <sys/stat.h>
-#include <sys/time.h>
-#include <sys/types.h>
-#ifdef __linux__
-#include <sys/syscall.h>
-#endif
+#include <strings.h>   // strncasecmp
+#include <time.h>
 
-#include <stdatomic.h>
 #include <SoapySDR/Device.h>
 #include <SoapySDR/Formats.h>
 #include <SoapySDR/Version.h>
 
-#define PLUGIN_NAME "soapy"
-#define FEED_CFG_IN   "soapy.config.in"
-#define FEED_CFG_OUT  "soapy.config.out"
-#define FEED_IQ_INFO  "soapy.IQ-info"
-
-#define MAGIC_PHIQ 0x51494850u /* 'P''H''I''Q' */
-#define PHIQ_VERSION 1u
+#include "ph_uds_protocol.h"
+#include "plugin.h"
+#include "common.h"
+#include "ctrlmsg.h"   // control-plane helpers
 
 #ifndef MFD_CLOEXEC
 #define MFD_CLOEXEC 0x0001
 #endif
 
+#define PLUGIN_NAME "soapy"
+
+/* feeds (control-plane helpers auto-create soapy.config.{in,out}) */
+#define FEED_IQ_INFO  "soapy.IQ-info"
+
+/* ---------- small compat for memfd/shm_open ---------- */
+static int xmemfd_create(const char *name, unsigned int flags){
+#ifdef SYS_memfd_create
+    return (int)syscall(SYS_memfd_create, name, flags);
+#else
+    (void)name; (void)flags; errno=ENOSYS; return -1;
+#endif
+}
+static int create_shm_fd(const char *tag, size_t bytes){
+    int fd = xmemfd_create(tag, MFD_CLOEXEC);
+    if(fd>=0){
+        if(ftruncate(fd, (off_t)bytes)<0){ int e=errno; close(fd); errno=e; return -1; }
+        return fd;
+    }
+    char name[64]; snprintf(name, sizeof name, "/%s-%d", tag, getpid());
+    fd = shm_open(name, O_CREAT|O_RDWR, 0600);
+    if(fd<0) return -1;
+    shm_unlink(name);
+    if(ftruncate(fd, (off_t)bytes)<0){ int e=errno; close(fd); errno=e; return -1; }
+    return fd;
+}
+static void sleep_ms(int ms){ struct timespec ts={ ms/1000, (ms%1000)*1000000L }; nanosleep(&ts,NULL); }
+
+/* ---------- IQ ring header (absolute counters) ---------- */
 typedef enum {
-    PHIQ_FMT_CF32 = 1, // complex float32
-    PHIQ_FMT_CS16 = 2  // complex int16 (not used yet)
+    PHIQ_FMT_CF32 = 1, // interleaved I,Q float32 (8 bytes/frame)
+    PHIQ_FMT_CS16 = 2  // interleaved I,Q int16  (4 bytes/frame)
 } phiq_fmt_t;
 
 typedef struct {
-    uint32_t magic;
+    uint32_t magic;               // 'PHIQ'
     uint32_t version;
-    _Atomic uint64_t seq;
-    _Atomic uint64_t wpos;
-    _Atomic uint64_t rpos;
-    uint32_t capacity;
-    uint32_t used;
-    uint32_t bytes_per_samp;
-    uint32_t channels;
-    double sample_rate;
-    double center_freq;
-    uint32_t fmt;
-    uint8_t reserved[64];
-    uint8_t data[];
+    _Atomic uint64_t seq;         // increments per write
+    _Atomic uint64_t wpos;        // ABSOLUTE bytes written
+    _Atomic uint64_t rpos;        // ABSOLUTE bytes read (by consumer)
+    uint32_t capacity;            // ring size in bytes (data[])
+    uint32_t used;                // optional mirror; producer may fill (consumer ignores)
+    uint32_t bytes_per_samp;      // bytes per COMPLEX frame (I+Q together)
+    uint32_t channels;            // 1 (complex stream)
+    double   sample_rate;
+    double   center_freq;
+    uint32_t fmt;                 // phiq_fmt_t
+    uint8_t  reserved[64];
+    uint8_t  data[];
 } phiq_hdr_t;
 
-static const char *g_sock_path = NULL;
-static pthread_t g_thr_io, g_thr_ctrl;
-static volatile int g_run = 0;
+enum { MAGIC_PHIQ = 0x51494850u /* 'P''H''I''Q' */, PHIQ_VERSION=1u };
 
+/* ---------- addon state ---------- */
+static const char *g_sock = NULL;
+static pthread_t   g_thr;       // control-plane + bus
+static pthread_t   g_rxthr;     // SDR RX thread
+static _Atomic int g_run = 0;
+
+static ph_ctrl_t   g_ctrl;      // control-plane ctx (provides .fd)
+
+/* soapy device state */
 typedef struct {
     SoapySDRDevice *dev;
     SoapySDRStream *rx;
-    double sr;
-    double cf;
-    double bw;
-    int chan;
-    int active;
-} soapy_state_t;
+    double sr, cf, bw;
+    int    chan;
+} soapy_t;
+static soapy_t g_dev = {0};
 
-static soapy_state_t G = {0};
+static _Atomic int g_active = 0;   // start/stop gating
 
-static int g_shm_fd = -1;
-static phiq_hdr_t *g_hdr = NULL;
-static size_t g_map_bytes = 0;
+/* IQ shm map */
+static int        g_memfd = -1;
+static phiq_hdr_t *g_hdr  = NULL;
+static size_t     g_map_bytes = 0;
 
-static int try_memfd_create(const char *name, unsigned flags){
-#if defined(__linux__) && defined(SYS_memfd_create)
-    int fd = (int)syscall(SYS_memfd_create, name, flags);
-    return fd;
-#else
-    (void)name; (void)flags;
-    errno = ENOSYS;
-    return -1;
-#endif
-}
-
-static int create_shm_fd(size_t bytes){
-    int memfd = try_memfd_create("ph-iq", MFD_CLOEXEC);
-    if(memfd >= 0){
-        if(ftruncate(memfd, (off_t)bytes) != 0){
-            int e = errno; close(memfd); errno=e; return -1;
-        }
-        return memfd;
-    }
-    char name[64]; snprintf(name, sizeof name, "/ph-iq-%d", getpid());
-    int shmfd = shm_open(name, O_CREAT|O_RDWR, 0600);
-    if(shmfd < 0) return -1;
-    shm_unlink(name);
-    if(ftruncate(shmfd, (off_t)bytes)!=0){ int e=errno; close(shmfd); errno=e; return -1; }
-    return shmfd;
-}
-
-static void *map_shm(size_t bytes){
-    void *p = mmap(NULL, bytes, PROT_READ|PROT_WRITE, MAP_SHARED, g_shm_fd, 0);
-    if(p==MAP_FAILED) return NULL;
-    return p;
-}
-
-static void unmap_shm(void){
-    if(g_hdr){
-        munmap(g_hdr, g_map_bytes);
-        g_hdr=NULL;
-    }
-    if(g_shm_fd>=0){
-        close(g_shm_fd);
-        g_shm_fd=-1;
-    }
-    g_map_bytes=0;
-}
-
-static void publish_utf8(int fd, const char *feed, const char *msg){
-    char js[POC_MAX_JSON];
+/* ---------- helpers ---------- */
+static void publish_txt(const char *feed, const char *txt){
     char esc[POC_MAX_JSON/2];
     size_t bi=0;
-    for(const char *p=msg; *p && bi+2<sizeof esc; ++p){
-        if(*p=='"' || *p=='\\') esc[bi++]='\\';
+    for(const char *p=txt; *p && bi+2<sizeof esc; ++p){
+        if(*p=='"'||*p=='\\') esc[bi++]='\\';
         esc[bi++]=*p;
     }
     esc[bi]=0;
-    snprintf(js, sizeof js, "{\"type\":\"publish\",\"feed\":\"%s\",\"data\":\"%s\",\"encoding\":\"utf8\"}", feed, esc);
-    send_frame_json(fd, js, strlen(js));
+    char js[POC_MAX_JSON];
+    snprintf(js,sizeof js,"{\"txt\":\"%s\"}",esc);
+    ph_publish(g_ctrl.fd, feed, js);
 }
-
-static void create_feed(int fd, const char *feed){
-    char js[256];
-    snprintf(js, sizeof js, "{\"type\":\"create_feed\",\"feed\":\"%s\"}", feed);
-    send_frame_json(fd, js, strlen(js));
-}
-
-static int send_iq_info_with_fd(int fd){
-    if(g_shm_fd<0 || !g_hdr) return -1;
-    char js[512];
-    int len = snprintf(js, sizeof js,
-        "{"
-        "\"type\":\"publish\","
-        "\"feed\":\"%s\","
-        "\"encoding\":\"utf8\","
-        "\"data\":\"{"
-            "\\\"fmt\\\":%u,"
-            "\\\"bytes_per_samp\\\":%u,"
-            "\\\"channels\\\":%u,"
-            "\\\"sample_rate\\\":%.6f,"
-            "\\\"center_freq\\\":%.6f,"
-            "\\\"capacity\\\":%u"
-        "}\""
-        "}",
+static void publish_iq_memfd(void){
+    if(g_memfd<0 || !g_hdr) return;
+    char js[POC_MAX_JSON];
+    int n = snprintf(js,sizeof js,
+        "{\"type\":\"publish\",\"feed\":\"%s\",\"encoding\":\"utf8\","
+         "\"data\":\"{\\\"fmt\\\":%u,\\\"bytes_per_samp\\\":%u,\\\"channels\\\":%u,"
+                     "\\\"sample_rate\\\":%.6f,\\\"center_freq\\\":%.6f,\\\"capacity\\\":%u}\"}",
         FEED_IQ_INFO,
         g_hdr->fmt, g_hdr->bytes_per_samp, g_hdr->channels,
-        g_hdr->sample_rate, g_hdr->center_freq, g_hdr->capacity
-    );
-    int fds[1] = { g_shm_fd };
-    return send_frame_json_with_fds(fd, js, (size_t)len, fds, 1);
+        g_hdr->sample_rate, g_hdr->center_freq, g_hdr->capacity);
+    int fds[1]={ g_memfd };
+    send_frame_json_with_fds(g_ctrl.fd, js, (size_t)n, fds, 1);
 }
 
-static void soapy_close(void){
-    if(G.rx){
-        SoapySDRDevice_deactivateStream(G.dev, G.rx, 0, 0);
-        SoapySDRDevice_closeStream(G.dev, G.rx);
-        G.rx=NULL;
-    }
-    if(G.dev){
-        SoapySDRDevice_unmake(G.dev);
-        G.dev=NULL;
-    }
-    G.active=0;
+/* ring create */
+static int iq_ring_open(size_t capacity_bytes, double sr, double cf, phiq_fmt_t fmt){
+    if(g_hdr){ munmap(g_hdr, g_map_bytes); g_hdr=NULL; }
+    if(g_memfd>=0){ close(g_memfd); g_memfd=-1; }
+
+    size_t total = sizeof(phiq_hdr_t) + capacity_bytes;
+    int fd = create_shm_fd("ph-iq", total);
+    if(fd<0) return -1;
+    void *map = mmap(NULL, total, PROT_READ|PROT_WRITE, MAP_SHARED, fd, 0);
+    if(!map || map==MAP_FAILED){ int e=errno; close(fd); errno=e; return -1; }
+
+    g_memfd = fd; g_hdr = (phiq_hdr_t*)map; g_map_bytes = total;
+    memset(g_hdr, 0, sizeof(phiq_hdr_t));
+    g_hdr->magic = MAGIC_PHIQ;
+    g_hdr->version = PHIQ_VERSION;
+    atomic_store(&g_hdr->seq,  0);
+    atomic_store(&g_hdr->wpos, 0);
+    atomic_store(&g_hdr->rpos, 0);
+    g_hdr->capacity       = (uint32_t)capacity_bytes;
+    g_hdr->fmt            = (uint32_t)fmt;
+    g_hdr->bytes_per_samp = (fmt==PHIQ_FMT_CF32)? 8u : 4u;
+    g_hdr->channels       = 1;
+    g_hdr->sample_rate    = sr;
+    g_hdr->center_freq    = cf;
+    return 0;
+}
+static void iq_ring_close(void){
+    if(g_hdr && g_hdr!=MAP_FAILED) munmap(g_hdr, g_map_bytes);
+    if(g_memfd>=0) close(g_memfd);
+    g_hdr=NULL; g_memfd=-1; g_map_bytes=0;
 }
 
+/* soapy open/config */
 static int soapy_list(char *out, size_t outcap){
-    size_t count = 0;
-    SoapySDRKwargs *results = SoapySDRDevice_enumerate(NULL, &count);
-    size_t p = 0;
-    p += (size_t)snprintf(out+p, outcap>p?outcap-p:0, "found=%zu\n", count);
-    for(size_t i=0;i<count;i++){
-        const SoapySDRKwargs *k = &results[i];
-        p += (size_t)snprintf(out+p, outcap>p?outcap-p:0, "[%zu] ", i);
-        for(size_t j=0;j<k->size;j++){
-            p += (size_t)snprintf(out+p, outcap>p?outcap-p:0, "%s=%s ", k->keys[j], k->vals[j]);
-        }
-        p += (size_t)snprintf(out+p, outcap>p?outcap-p:0, "\n");
+    size_t n=0; SoapySDRKwargs *res = SoapySDRDevice_enumerate(NULL,&n);
+    size_t p=0; p+=(size_t)snprintf(out+p, outcap>p?outcap-p:0, "found=%zu\n", n);
+    for(size_t i=0;i<n;i++){
+        const SoapySDRKwargs *k=&res[i];
+        p+=(size_t)snprintf(out+p,outcap>p?outcap-p:0,"[%zu] ",i);
+        for(size_t j=0;j<k->size;j++)
+            p+=(size_t)snprintf(out+p,outcap>p?outcap-p:0,"%s=%s ",k->keys[j],k->vals[j]);
+        p+=(size_t)snprintf(out+p,outcap>p?outcap-p:0,"\n");
     }
-    SoapySDRKwargsList_clear(results, count);
-    return 0;
+    SoapySDRKwargsList_clear(res,n); return 0;
 }
-
 static int soapy_open_idx(int idx){
-    size_t count = 0;
-    SoapySDRKwargs *results = SoapySDRDevice_enumerate(NULL, &count);
-    if(idx < 0 || (size_t)idx >= count){
-        SoapySDRKwargsList_clear(results, count);
-        return -1;
-    }
-    G.dev = SoapySDRDevice_make(&results[idx]);
-    SoapySDRKwargsList_clear(results, count);
-    if(!G.dev) return -1;
-    G.chan = 0;
-    G.sr = 2.4e6;
-    G.cf = 100e6;
-    G.bw = 0.0;
+    size_t n=0; SoapySDRKwargs *res = SoapySDRDevice_enumerate(NULL,&n);
+    if(idx<0 || (size_t)idx>=n){ SoapySDRKwargsList_clear(res,n); return -1; }
+    g_dev.dev = SoapySDRDevice_make(&res[idx]);
+    SoapySDRKwargsList_clear(res,n);
+    if(!g_dev.dev) return -1;
+    g_dev.chan=0; g_dev.sr=2.4e6; g_dev.cf=100e6; g_dev.bw=0.0;
     return 0;
 }
-
 static int soapy_apply_params(void){
-    if(!G.dev) return -1;
-    if(G.cf>0) SoapySDRDevice_setFrequency(G.dev, SOAPY_SDR_RX, G.chan, G.cf, NULL);
-    if(G.sr>0) SoapySDRDevice_setSampleRate(G.dev, SOAPY_SDR_RX, G.chan, G.sr);
-    if(G.bw>0) SoapySDRDevice_setBandwidth(G.dev, SOAPY_SDR_RX, G.chan, G.bw);
+    if(!g_dev.dev) return -1;
+    if(g_dev.cf>0) SoapySDRDevice_setFrequency(g_dev.dev, SOAPY_SDR_RX, g_dev.chan, g_dev.cf, NULL);
+    if(g_dev.sr>0) SoapySDRDevice_setSampleRate(g_dev.dev, SOAPY_SDR_RX, g_dev.chan, g_dev.sr);
+    if(g_dev.bw>0) SoapySDRDevice_setBandwidth(g_dev.dev, SOAPY_SDR_RX, g_dev.chan, g_dev.bw);
     return 0;
 }
-
-static int soapy_start_stream(void){
-    if(!G.dev) return -1;
+static int soapy_start(phiq_fmt_t fmt){
+    if(!g_dev.dev) return -1;
     if(!g_hdr){
-        size_t capacity = 8u<<20; // 8 MiB
-        size_t total = sizeof(phiq_hdr_t) + capacity;
-        g_shm_fd = create_shm_fd(total);
-        if(g_shm_fd < 0) return -1;
-        g_map_bytes = total;
-        g_hdr = (phiq_hdr_t*)map_shm(total);
-        if(!g_hdr) { unmap_shm(); return -1; }
-        memset(g_hdr, 0, sizeof(phiq_hdr_t));
-        g_hdr->magic = MAGIC_PHIQ;
-        g_hdr->version = PHIQ_VERSION;
-        g_hdr->bytes_per_samp = 8u; // CF32
-        g_hdr->channels = 1;
-        g_hdr->fmt = PHIQ_FMT_CF32;
-        g_hdr->capacity = (uint32_t)capacity;
-        g_hdr->sample_rate = G.sr;
-        g_hdr->center_freq = G.cf;
+        /* 8 MiB ring is ~0.33 s at 2.4 Msps CF32; tune as needed */
+        size_t cap = 8u<<20;
+        if(iq_ring_open(cap, g_dev.sr, g_dev.cf, fmt)!=0) return -1;
     }
-    size_t chan = (size_t)G.chan;
-    SoapySDRStream *rx = SoapySDRDevice_setupStream(G.dev, SOAPY_SDR_RX, SOAPY_SDR_CF32, &chan, 1, NULL);
-    if(!rx) return -1;
-    G.rx = rx;
-    if(SoapySDRDevice_activateStream(G.dev, G.rx, 0, 0, 0) != 0){
-        SoapySDRDevice_closeStream(G.dev, G.rx);
-        G.rx=NULL;
-        return -1;
+    /* choose Soapy stream format */
+    const char *soap_fmt = (fmt==PHIQ_FMT_CF32)? SOAPY_SDR_CF32 : SOAPY_SDR_CS16;
+    size_t ch = (size_t)g_dev.chan;
+    g_dev.rx = SoapySDRDevice_setupStream(g_dev.dev, SOAPY_SDR_RX, soap_fmt, &ch, 1, NULL);
+    if(!g_dev.rx) return -1;
+    if(SoapySDRDevice_activateStream(g_dev.dev, g_dev.rx, 0, 0, 0)!=0){
+        SoapySDRDevice_closeStream(g_dev.dev, g_dev.rx); g_dev.rx=NULL; return -1;
     }
-    G.active = 1;
+    atomic_store(&g_active, 1);
+    publish_iq_memfd(); /* publish memfd once started */
     return 0;
 }
-
-static void soapy_stop_stream(void){
-    if(G.rx){
-        SoapySDRDevice_deactivateStream(G.dev, G.rx, 0, 0);
-        SoapySDRDevice_closeStream(G.dev, G.rx);
-        G.rx=NULL;
+static void soapy_stop(void){
+    atomic_store(&g_active, 0);
+    if(g_dev.rx){
+        SoapySDRDevice_deactivateStream(g_dev.dev, g_dev.rx, 0, 0);
+        SoapySDRDevice_closeStream(g_dev.dev, g_dev.rx);
+        g_dev.rx=NULL;
     }
-    G.active=0;
 }
 
-static void *io_thread(void *arg){
+/* ---------- RX thread: read Soapy, write ring (absolute counters + overrun policy) ---------- */
+static void *rx_thread(void *arg){
     (void)arg;
-    int fd = uds_connect(g_sock_path);
-    if(fd < 0){ log_msg(LOG_ERROR, "["PLUGIN_NAME"] IO connect failed"); return NULL; }
-    set_nonblock(fd);
+    uint8_t tmp[1<<16];
+    void *buffs[1]={ tmp };
 
-    uint8_t tmpbuf[1<<16];
-    void *buffs[1] = { tmpbuf };
-    const size_t elems = sizeof(tmpbuf) / (sizeof(float)*2);
-    while(g_run){
-        if(G.active && G.rx){
-            int flags=0;
-            long long ts=0;
-            int got = SoapySDRDevice_readStream(G.dev, G.rx, buffs, elems, &flags, &ts, 10000);
-            if(got > 0 && g_hdr){
-                size_t bytes = (size_t)got * g_hdr->bytes_per_samp;
-                uint64_t w = g_hdr->wpos;
-                uint8_t *dst = g_hdr->data;
-                uint32_t cap = g_hdr->capacity;
-                size_t first = bytes;
-                uint64_t mod = (w % cap);
-                if(mod + bytes > cap){
-                    first = cap - mod;
-                }
-                memcpy(dst + mod, tmpbuf, first);
-                if(first < bytes){
-                    memcpy(dst, tmpbuf + first, bytes - first);
-                }
-                atomic_store(&g_hdr->wpos, (w + bytes) % cap);
-                if(g_hdr->used + bytes > cap) atomic_store(&g_hdr->used, cap); else g_hdr->used += (uint32_t)bytes;
-                atomic_store(&g_hdr->seq, atomic_load(&g_hdr->seq)+1);
-            }
-        } else {
-            usleep(1000*10);
+    while(atomic_load(&g_run)){
+        if(!atomic_load(&g_active) || !g_dev.rx || !g_hdr){ sleep_ms(10); continue; }
+
+        int flags=0; long long ts=0;
+        int elems;
+        if(g_hdr->fmt == PHIQ_FMT_CF32){
+            elems = (int)( sizeof(tmp) / (2*sizeof(float)) );
+        }else{
+            elems = (int)( sizeof(tmp) / (2*sizeof(int16_t)) );
         }
+        int got = SoapySDRDevice_readStream(g_dev.dev, g_dev.rx, buffs, elems, &flags, &ts, 10000);
+        if(got <= 0) continue;
+
+        const size_t bytes = (size_t)got * g_hdr->bytes_per_samp;
+        const uint32_t cap = g_hdr->capacity;
+
+        uint64_t w = atomic_load(&g_hdr->wpos);
+        uint64_t r = atomic_load(&g_hdr->rpos);
+
+        uint64_t prospective = w + (uint64_t)bytes;
+        if (prospective - r > cap){
+            uint64_t new_r = prospective - cap;
+            atomic_store(&g_hdr->rpos, new_r);
+            r = new_r;
+        }
+
+        size_t mod = (size_t)(w % cap);
+        size_t first = bytes;
+        if(mod + bytes > cap) first = cap - mod;
+
+        memcpy(g_hdr->data + mod, tmp, first);
+        if(first < bytes) memcpy(g_hdr->data, tmp + first, bytes - first);
+
+        atomic_store(&g_hdr->wpos, w + bytes);
+        uint64_t used = (w + bytes) - r; if(used > cap) used = cap; g_hdr->used = (uint32_t)used;
+        atomic_fetch_add(&g_hdr->seq, 1);
+
+        /* keep meta up to date */
+        g_hdr->sample_rate = g_dev.sr;
+        g_hdr->center_freq = g_dev.cf;
     }
-    close(fd);
     return NULL;
 }
 
-static void handle_cmd(int fd, const char *cmd){
-    if(strncmp(cmd,"list",4)==0){
-        char buf[4096]={0};
-        soapy_list(buf, sizeof buf);
-        publish_utf8(fd, FEED_CFG_OUT, buf);
+/* ---------- command handler (via ctrl dispatcher) ---------- */
+static _Atomic phiq_fmt_t g_fmt = PHIQ_FMT_CF32;
+
+static void on_cmd(ph_ctrl_t *c, const char *line, void *user){
+    (void)user;
+    while(*line==' '||*line=='\t') line++;
+
+    if(strncmp(line,"help",4)==0){
+        ph_reply(c, "{\"ok\":true,"
+                      "\"help\":\"help|list|select <idx>|set sr=<Hz> cf=<Hz> [bw=<Hz>]|"
+                               "fmt <cf32|cs16>|start|stop|open|status|"
+                               "subscribe <feed>|unsubscribe <feed>\"}");
         return;
     }
-    if(strncmp(cmd,"select ",7)==0){
-        int idx = atoi(cmd+7);
-        if(soapy_open_idx(idx)==0){
-            soapy_apply_params();
-            publish_utf8(fd, FEED_CFG_OUT, "selected");
-        } else {
-            publish_utf8(fd, FEED_CFG_OUT, "select failed");
-        }
+
+    if(strncmp(line,"list",4)==0){
+        char buf[4096]={0}; soapy_list(buf,sizeof buf);
+        publish_txt("soapy.config.out", buf);
+        ph_reply_ok(c,"listed");
         return;
     }
-    if(strncmp(cmd,"set ",4)==0){
-        double sr=G.sr, cf=G.cf, bw=G.bw;
-        const char *p = cmd+4;
+
+    if(strncmp(line,"select ",7)==0){
+        int idx = atoi(line+7);
+        if(soapy_open_idx(idx)==0){ soapy_apply_params(); ph_reply_ok(c,"selected"); }
+        else ph_reply_err(c,"select failed");
+        return;
+    }
+
+    if(strncmp(line,"set ",4)==0){
+        double sr=g_dev.sr, cf=g_dev.cf, bw=g_dev.bw;
+        const char *p=line+4;
         while(*p){
             while(*p==' ') p++;
             if(strncmp(p,"sr=",3)==0){ sr = strtod(p+3,(char**)&p); }
@@ -330,84 +314,110 @@ static void handle_cmd(int fd, const char *cmd){
             else if(strncmp(p,"bw=",3)==0){ bw = strtod(p+3,(char**)&p); }
             else { while(*p && *p!=' ') p++; }
         }
-        G.sr=sr; G.cf=cf; G.bw=bw;
+        g_dev.sr=sr; g_dev.cf=cf; g_dev.bw=bw;
         soapy_apply_params();
-        if(g_hdr){ g_hdr->sample_rate=G.sr; g_hdr->center_freq=G.cf; }
-        publish_utf8(fd, FEED_CFG_OUT, "ok");
+        if(g_hdr){ g_hdr->sample_rate=g_dev.sr; g_hdr->center_freq=g_dev.cf; }
+        ph_reply_okf(c,"set sr=%.0f cf=%.0f bw=%.0f", sr, cf, bw);
         return;
     }
-    if(strcmp(cmd,"start")==0){
-        if(soapy_start_stream()==0){
-            (void)send_iq_info_with_fd(fd);
-            publish_utf8(fd, FEED_CFG_OUT, "started");
-        } else publish_utf8(fd, FEED_CFG_OUT, "start failed");
+
+    if(strncmp(line,"fmt ",4)==0){
+        const char *p=line+4; while(*p==' '||*p=='\t') p++;
+        if(strncasecmp(p,"cf32",4)==0){ g_fmt = PHIQ_FMT_CF32; ph_reply_ok(c,"fmt=CF32"); }
+        else if(strncasecmp(p,"cs16",4)==0){ g_fmt = PHIQ_FMT_CS16; ph_reply_ok(c,"fmt=CS16"); }
+        else ph_reply_err(c,"fmt arg");
         return;
     }
-    if(strcmp(cmd,"stop")==0){
-        soapy_stop_stream();
-        publish_utf8(fd, FEED_CFG_OUT, "stopped");
+
+    if(strncmp(line,"start",5)==0){
+        if(soapy_start(atomic_load(&g_fmt))==0){ publish_iq_memfd(); ph_reply_ok(c,"started"); }
+        else ph_reply_err(c,"start failed");
         return;
     }
-    publish_utf8(fd, FEED_CFG_OUT, "unknown");
+
+    if(strncmp(line,"stop",4)==0){
+        soapy_stop(); ph_reply_ok(c,"stopped"); return;
+    }
+
+    if(strncmp(line,"open",4)==0){
+        publish_iq_memfd(); ph_reply_ok(c,"republished"); return;
+    }
+
+    if(strncmp(line,"status",6)==0){
+        char js[384];
+        snprintf(js,sizeof js,
+            "{\"ok\":true,\"sr\":%.1f,\"cf\":%.1f,\"bw\":%.1f,"
+             "\"active\":%d,\"fmt\":%u,\"bps\":%u}",
+            g_dev.sr,g_dev.cf,g_dev.bw,(int)atomic_load(&g_active),
+            (unsigned)atomic_load(&g_fmt),
+            g_hdr?g_hdr->bytes_per_samp:0u);
+        ph_reply(c, js);
+        return;
+    }
+
+    if(strncmp(line,"subscribe ",10)==0){
+        const char *feed=line+10; while(*feed==' '||*feed=='\t') feed++;
+        if(*feed){ ph_subscribe(c->fd, feed); ph_reply_okf(c,"subscribed %s",feed); }
+        else ph_reply_err(c,"subscribe arg");
+        return;
+    }
+    if(strncmp(line,"unsubscribe ",12)==0){
+        const char *feed=line+12; while(*feed==' '||*feed=='\t') feed++;
+        if(*feed){ ph_unsubscribe(c->fd, feed); ph_reply_okf(c,"unsubscribed %s",feed); }
+        else ph_reply_err(c,"unsubscribe arg");
+        return;
+    }
+
+    ph_reply_err(c,"unknown");
 }
 
-static void *ctrl_thread(void *arg){
+/* ---------- worker (single thread: ctrl + bus) ---------- */
+static void *run(void *arg){
     (void)arg;
-    int fd = uds_connect(g_sock_path);
-    if(fd < 0){ log_msg(LOG_ERROR, "["PLUGIN_NAME"] ctrl connect failed"); return NULL; }
-    create_feed(fd, FEED_CFG_OUT);
-    create_feed(fd, FEED_IQ_INFO);
-    char js[256];
-    snprintf(js, sizeof js, "{\"type\":\"subscribe\",\"feed\":\"%s\"}", FEED_CFG_IN);
-    send_frame_json(fd, js, strlen(js));
+    int fd=-1;
+    for(int i=0;i<50;i++){ fd = uds_connect(g_sock?g_sock:PH_SOCK_PATH); if(fd>=0) break; sleep_ms(100); }
+    if(fd<0) return NULL;
 
-    g_run = 1;
-    char rbuf[POC_MAX_JSON];
-    while(g_run){
-        int n = recv_frame_json(fd, rbuf, sizeof rbuf, 250);
-        if(n <= 0) continue;
-        char type[32]={0}, feed[128]={0};
-        if(json_get_type(rbuf, type, sizeof type)!=0) continue;
-        if(strcmp(type,"publish")==0){
-            if(json_get_string(rbuf,"feed", feed, sizeof feed)==0 && strcmp(feed, FEED_CFG_IN)==0){
-                char enc[32]={0};
-                char data[POC_MAX_JSON]={0};
-                if(json_get_string(rbuf,"encoding",enc,sizeof enc)!=0){ strcpy(enc,"utf8"); }
-                if(json_get_string(rbuf,"data",data,sizeof data)==0){
-                    if(strcmp(enc,"utf8")==0){
-                        handle_cmd(fd, data);
-                    } else if(strcmp(enc,"base64")==0){
-                        size_t maxlen = b64_decoded_maxlen(strlen(data));
-                        char *tmp = (char*)malloc(maxlen+1);
-                        if(tmp){
-                            size_t outlen=0;
-                            if(b64_decode(data, strlen(data), (uint8_t*)tmp, &outlen)==0){
-                                tmp[outlen]=0;
-                                handle_cmd(fd, tmp);
-                            }
-                            free(tmp);
-                        }
-                    }
-                }
-            }
-        }
+    ph_ctrl_init(&g_ctrl, fd, "soapy");     // creates soapy.config.{in,out} and subscribes to .in
+    ph_ctrl_advertise(&g_ctrl);
+    ph_create_feed(fd, FEED_IQ_INFO);       // data feed produced by this addon
+
+    /* launch RX thread */
+    atomic_store(&g_run, 1);
+    if(pthread_create(&g_rxthr, NULL, rx_thread, NULL)!=0){
+        atomic_store(&g_run,0);
+        close(fd);
+        return NULL;
     }
+
+    char js[POC_MAX_JSON];
+    while(atomic_load(&g_run)){
+        int got = recv_frame_json(fd, js, sizeof js, 100);
+        if(got<=0) continue;
+
+        /* delegate commands to on_cmd via shared dispatcher */
+        if(ph_ctrl_dispatch(&g_ctrl, js, (size_t)got, on_cmd, NULL)){
+            continue;
+        }
+
+        /* (Optional) could handle other subscribed data feeds here */
+    }
+
     close(fd);
     return NULL;
 }
 
-static const char *g_name = PLUGIN_NAME;
-
-const char* plugin_name(void){ return g_name; }
+/* ---------- plugin ABI ---------- */
+const char* plugin_name(void){ return PLUGIN_NAME; }
 
 bool plugin_init(const plugin_ctx_t *ctx, plugin_caps_t *out){
-    if(!ctx) return false;
-    g_sock_path = ctx->sock_path;
-    static const char *cons[] = { FEED_CFG_IN, NULL };
-    static const char *prod[] = { FEED_CFG_OUT, FEED_IQ_INFO, NULL };
+    if(!ctx || ctx->abi!=PLUGIN_ABI) return false;
+    g_sock = ctx->sock_path;
+    static const char *cons[] = { "soapy.config.in", NULL };
+    static const char *prod[] = { "soapy.config.out", FEED_IQ_INFO, NULL };
     if(out){
-        out->name = g_name;
-        out->version = "0.1.2";
+        out->name = plugin_name();
+        out->version = "0.3.1";   // fix: proper create_shm_fd(tag, bytes) + strings.h
         out->consumes = cons;
         out->produces = prod;
     }
@@ -415,17 +425,19 @@ bool plugin_init(const plugin_ctx_t *ctx, plugin_caps_t *out){
 }
 
 bool plugin_start(void){
-    g_run = 1;
-    if(pthread_create(&g_thr_ctrl, NULL, ctrl_thread, NULL)!=0) return false;
-    if(pthread_create(&g_thr_io, NULL, io_thread, NULL)!=0){ g_run=0; pthread_join(g_thr_ctrl,NULL); return false; }
-    return true;
+    return pthread_create(&g_thr, NULL, run, NULL)==0;
 }
 
 void plugin_stop(void){
-    g_run = 0;
-    pthread_join(g_thr_io, NULL);
-    pthread_join(g_thr_ctrl, NULL);
-    soapy_stop_stream();
-    soapy_close();
-    unmap_shm();
+    atomic_store(&g_run, 0);
+    pthread_join(g_thr, NULL);
+
+    /* stop RX + free resources */
+    soapy_stop();
+    if(g_dev.dev){
+        if(g_dev.rx){ SoapySDRDevice_closeStream(g_dev.dev, g_dev.rx); g_dev.rx=NULL; }
+        SoapySDRDevice_unmake(g_dev.dev); g_dev.dev=NULL;
+    }
+    iq_ring_close();
 }
+
