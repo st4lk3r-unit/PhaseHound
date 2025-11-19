@@ -12,6 +12,7 @@ src/audiosink_alsa.c \
 src/audiosink_ring.c \
 ../../../src/common.c \
 ../../../src/common/ctrlmsg.c \
+../../../src/common/ph_shm.c \
 
 all: $(SO)
 

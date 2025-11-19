@@ -4,47 +4,63 @@ Lightweight modular SDR runtime in pure C
 
 ## What is PhaseHound?
 
-PhaseHound is a modular SDR core designed for people who actually care about RF, latency, and control — not just pretty GUIs.
+PhaseHound is a modular SDR core designed for people who actually care about RF, latency, architecture, and control — not just pretty GUIs.
 
-- **Core daemon (`ph-core`)**
-  A broker that manages local "feeds", routes messages, and glues modules together. Think lightweight signal bus.
+- **Core daemon (`ph-core`)**  
+  A broker that manages local "feeds", routes messages, and glues modules together. Think lightweight signal bus for SDR.
 
-- **Runtime-loadable add-ons (.so plugins)**
-  Each add-on can publish IQ streams, demodulate, decode, sink audio, log metadata, etc. Add-ons register feeds and talk to the core at runtime. You can load/unload them without restarting.
+- **Runtime-loadable add-ons (.so plugins)**  
+  Each add-on can publish IQ streams, demodulate, decode, sink audio, log metadata, etc.  
+  Add-ons register feeds dynamically and talk to the core at runtime.  
+  They can be loaded / unloaded without restarting.
 
-- **CLI (`ph-cli`)**
-  A simple control tool that speaks the core protocol over a Unix domain socket. You can:
-  - list addons / feeds
-  - subscribe to live data
-  - send commands to addons
-  - load/unload addons
+- **CLI (`ph-cli`)**  
+  A tiny control tool that speaks the core protocol over a Unix domain socket. You can:
+  - list addons / feeds  
+  - subscribe to live output  
+  - send commands to addons  
+  - load/unload addons  
+  - inspect IQ/PCM ring announcements  
 
 The goal: a clean SDR processing pipeline that is:
-- headless
-- scriptable
-- zero bloat
-- fast enough for real RF work
+- headless  
+- scriptable  
+- zero bloat  
+- fast enough for real RF work  
+- **fully dynamic and explicitly wired by the user** through feed subscriptions.
 
 
 
 ## Why does this exist?
 
 Most SDR stacks fall into 2 buckets:
-1. Interactive lab tools (massive GUI, Python graphs, Qt widgets, etc.)
-2. Hardcoded one-shot receivers/demods that aren't composable.
 
-PhaseHound sits in the middle:
-- It's not a GUI app.
-- It's not a single demod.
-- It's a signal routing core that lets you wire sources → DSP → sink, on the fly, using plugins.
+1. Giant GUI labs (heavy, slow, not deployable).  
+2. Hardcoded demod chains that can't be composed.
 
-Example:
-- RF source from hardware via SoapySDR
-- WFM demodulator
-- Audio sink
-- ...all as independent add-ons talking over a shared memory bus, coordinated by `ph-core`.
+PhaseHound is a middle layer:
 
-You can extend it by dropping in a new `.so`. No need to recompile the core.
+- It's not a GUI.  
+- It's not a monolithic demod.  
+- It's a **signal routing runtime** that lets you wire:
+
+```
+
+RF source → DSP stages → decoders → sinks
+
+````
+
+…using dynamically loaded plugins.
+
+Example pipeline:
+
+- SoapySDR RF source (`soapy`)  
+- Wide FM demodulator (`wfmd`)  
+- Audio sink (`audiosink`)  
+- Monitoring via CLI  
+- All talking via **shared-memory rings** + control feeds.
+
+You extend it by dropping `.so` files — no rebuilding the core.
 
 
 
@@ -68,64 +84,86 @@ You can extend it by dropping in a new `.so`. No need to recompile the core.
     +--------------+                    +---------------+
     |   soapy.so   |                    |   wfmd.so     |
     | RF source    |                    | WFM demod     |
-    | (IQ out)     |                    | (Stereo PCM)  |
+    | (IQ ring)    |                    | (PCM ring)    |
     +--------------+                    +---------------+
             |                                   |
-            |      shared memory buffers        |
-            | file descriptors passed via UDS   |
-            |<--------------------------------->|
-            |                                   |
+            |   shared memory buffers (SHM FD)  |
+            |   attached over UDS via           |
+            |   SCM_RIGHTS                      |
             v                                   v
         +------------------+           +-----------------+
-        | iq-feed          |           | audio-feed      |
+        | soapy.IQ-info    |           | wfmd.audio-info |
         +------------------+           +-----------------+
                                                 |
                                                 v
                                       +------------------+
                                       | audiosink.so     |
-                                      | output / playback|
+                                      | audio playback   |
                                       +------------------+
-
-```
+````
 
 There are 3 important concepts:
 
 ### 1. Feeds
 
-A "feed" is a named channel in the broker. Add-ons publish to feeds (IQ samples, audio frames, metadata, telemetry, etc.). Other add-ons subscribe.
+A feed is a named channel in the broker.
+Add-ons **publish** to feeds or **subscribe** to them.
+
+Examples:
+
+* `soapy.config.in/out`
+* `wfmd.audio-info`
+* `soapy.IQ-info`
+* `dummy.foo` (custom)
 
 ### 2. Messages
 
-Messages are framed JSON sent over the Unix domain socket. Some messages also carry shared-memory file descriptors so high-rate data doesn't go through JSON.
+Messages are JSON frames over UDS.
+They may include file descriptors when announcing shared-memory buffers.
 
 ### 3. Add-ons
 
-An add-on is just a shared library (`.so`) implementing a tiny interface:
+Add-ons are `.so` files implementing:
 
-* register your feeds,
-* subscribe to what you need,
-* react to commands,
-* push data or announce new buffers.
+* feed registration
+* command parsing
+* publish/subscribe
+* SHM ring creation and consumption
+* DSP / decode loops
 
+Add-ons are totally decoupled; wiring is **explicit** and chosen by the user.
 
 ## Features (current status)
 
 * Pure C11 / `pthread` / `dlopen`
-* Brokered pub/sub model over a Unix domain socket
-* Runtime discovery and hot-loading of plugins
-* Shared memory ring buffers for IQ/audio (file descriptors passed with `SCM_RIGHTS`)
-* SoapySDR source add-on for live RF capture
-* Wide FM demodulator add-on
-* Audio sink / playback add-on
-* Dummy add-on for devs to learn the plugin API
-* Minimal CLI to control and observe the graph
+* UDS-based pub/sub broker
+* Dynamic addon discovery and hot loading
+* Zero-copy shared memory ring buffers (IQ + PCM)
+* File descriptors passed with `SCM_RIGHTS`
+* SoapySDR add-on for live RF capture
+* Wide FM demod add-on
+* Audio sink add-on (ALSA)
+* Dummy add-on for authors
+* Minimal CLI
+* **New normalized ABI with usage-tagged routing:**
 
-Status: core works, IQ → WFM → audio works, API is still evolving but already usable.
+  ```
+  subscribe <usage> <feed>
+  unsubscribe <usage>
+  ```
 
+  Examples:
+
+  * `subscribe iq-source soapy.IQ-info`
+  * `subscribe pcm-source wfmd.audio-info`
+
+Status: IQ → WFM → audio pipeline fully functional.
+ABI stabilizing.
+SHM rings normalized across addons.
 
 ## Quick start (FM radio demo)
 
-This is the "it actually does RF" demo.
+This is the “real RF” demo.
 
 ### 0. Build
 
@@ -140,21 +178,16 @@ make
 ./ph-core
 ```
 
-You should see logs like:
+Example output:
 
 ```text
 [INF] core listening on /tmp/phasehound-broker.sock
-[INF] autoload loaded plugin soapy
-[INF] autoload loaded plugin wfmd
-[INF] autoload loaded plugin audiosink
-...
+[INF] loaded plugin soapy
+[INF] loaded plugin wfmd
+[INF] loaded plugin audiosink
 ```
 
-(If your distro doesn't allow autoload from `src/addons/...`, you can `load` them manually — see below.)
-
-### 2. Use the CLI to inspect feeds
-
-In a second terminal:
+### 2. Inspect feeds
 
 ```bash
 ./ph-cli list feeds
@@ -163,159 +196,175 @@ In a second terminal:
 
 ### 3. Tune the SDR source
 
-Tell the Soapy add-on to open a device, set center frequency and sample rate.
-Example: 95.6 MHz FM broadcast, 2.4 MS/s, whatever gain the Soapy driver decides is sane.
+Example: FM broadcast at 100 MHz, 2.4 MS/s:
 
 ```bash
 ./ph-cli pub soapy.config.in \
-'{"cmd":"tune","freq_hz":95600000,"sample_rate":2400000,"gain":"auto"}'
+"set sr=2400000 cf=100.0e6 bw=1.5e6"
+./ph-cli pub soapy.config.in "select 0"
+./ph-cli pub soapy.config.in "start"
 ```
 
-### 4. Listen
+This allocates an **IQ SHM ring** and announces it on:
 
-At this point, data flow is:
+```
+soapy.IQ-info
+```
 
-`soapy.so` → (IQ feed in shared memory) → `wfmd.so` → (PCM feed) → `audiosink.so` → speakers.
+### 4. Wire the pipeline
 
-You should get audio out, and the logs in `ph-core` will show pipeline activity, underruns/overruns, etc.
+#### WFMD subscribes to IQ:
 
+```bash
+./ph-cli pub wfmd.config.in "subscribe iq-source soapy.IQ-info"
+./ph-cli pub soapy.config.in "open"     # republish memfd for newcomers
+```
+
+#### WFMD publishes its audio ring:
+
+```bash
+./ph-cli pub wfmd.config.in "open"
+```
+
+#### audiosink subscribes to PCM:
+
+```bash
+./ph-cli pub audiosink.config.in "subscribe pcm-source wfmd.audio-info"
+```
+
+#### Start DSP + playback:
+
+```bash
+./ph-cli pub wfmd.config.in "start"
+./ph-cli pub audiosink.config.in "start"
+```
+
+You should now hear FM audio.
 
 ## Quick start (developer/dummy demo)
 
-This one is meant for people writing new add-ons. It shows the command/response pattern without needing RF hardware.
-
-1. Load the `dummy` addon:
+Load the dummy addon:
 
 ```bash
 ./ph-cli load addon dummy
 ```
 
-2. Ask it for help:
+Help:
 
 ```bash
-./ph-cli pub dummy.config.in '{"cmd":"help"}'
+./ph-cli pub dummy.config.in "help"
 ```
 
-3. Ping it:
-
-```bash
-./ph-cli pub dummy.config.in '{"cmd":"ping"}'
-```
-
-4. Watch responses:
+Subscribe to its outputs:
 
 ```bash
 ./ph-cli sub dummy.config.out
-```
-
-5. `dummy.foo` exists purely to demonstrate arbitrary new feed types:
-
-```bash
 ./ph-cli sub dummy.foo
 ```
 
-From a plugin author point of view:
+Demo SHM feed:
 
-* `dummy.config.in` = commands in
-* `dummy.config.out` = replies / status
-* `dummy.foo` = "some feed I invented"
-  This is exactly how you're supposed to add new capabilities to PhaseHound. You don't patch the core; you ship a new `.so` with its own feeds.
+```bash
+./ph-cli pub dummy.config.in "shm-demo"
+```
 
+Dummy illustrates:
+
+* config feeds
+* arbitrary feeds
+* usage-tagged subscription
+* SHM creation
+* JSON replies
 
 ## ph-cli cheatsheet
 
 ```bash
 ./ph-cli list addons
 ./ph-cli list feeds
-./ph-cli load addon <name|/path/to/libsomething.so>
+./ph-cli load addon <name>
 ./ph-cli unload addon <name>
 
-# publish a JSON command/message to a feed
-./ph-cli pub <feed> '{"cmd":"...","arg":123}'
+# publish a control command
+./ph-cli pub <feed> "<text>"
 
-# subscribe to a feed and print everything it emits
+# subscribe to feed(s)
 ./ph-cli sub <feedA> [<feedB> ...]
 ```
 
-Subscriptions stay open and stream live. You can sub multiple feeds at once (useful for debugging data flow).
-
+You can subscribe to multiple feeds simultaneously, very useful for watching data flow live.
 
 ## How add-ons talk to each other
 
-* Control / metadata:
+### Control plane
 
-  * sent as framed JSON over the core’s Unix domain socket.
-  * The frame format is intentionally dead simple to parse/debug.
+* JSON messages over UDS
+* Typically on `<addon>.config.in/out`
+* Human-readable debugging
 
-* High-bandwidth sample data (IQ buffers, audio frames):
+### Data plane (high rate)
 
-  * passed as file descriptors using `SCM_RIGHTS` on that same socket,
-  * then memory-mapped shared ring buffers are used,
-  * atomic cursors coordinate producer/consumer without copies.
+* File descriptors sent over UDS using `SCM_RIGHTS`
+* IQ and PCM streams are **shared memory ring buffers**
+* Add-ons use atomic cursors for lock-free streaming
+* Zero copies, stable performance
 
-Translation: IQ at a couple MS/s and raw float audio are not shoved through JSON. You get proper throughput.
-
-This is almost always where other "simple" SDR toys fall apart. PhaseHound already has the right architecture for real signal rates.
-
+This avoids the classic “push samples through JSON/Python” problem.
 
 ## Dependencies
 
-**Required to build core + CLI:**
+**Required**
 
-* POSIX environment (Linux is tested)
-* `gcc`/`clang`, `make`
-* `pthread`
-* `dlopen` / `dlsym`
-* nothing exotic
+* Linux / POSIX
+* gcc/clang
+* pthread
+* dlopen
 
-**Optional (but strongly recommended if you want hardware RF input):**
+**Optional**
 
-* `libsoapysdr-dev`
+* SoapySDR (for hardware RF)
 
-SoapySDR is used by the `soapy` addon to talk to real radios (RTL-SDR, HackRF, Lime, etc.).
-If you don't install Soapy, everything else still builds — you just won't get live RF until we add file/network sources.
-
+Without SoapySDR, everything still builds — only hardware input is missing.
 
 ## Project status / roadmap
 
-* ✅ Core broker, message framing, feed registry
+* ✅ Core broker
+* ✅ Pub/sub model
 * ✅ CLI
-* ✅ SoapySDR source addon
-* ✅ WFM demod addon
-* ✅ Audio sink addon
-* ✅ Dummy addon for devs
-* 🔄 Shared memory ring buffers for IQ/audio
-* 🔄 Stable plugin API docs
-* 🔲 Digital voice / trunking / TETRA / DMR decoders
-* 🔲 Network source / file source addon
-* 🔲 Remote control over TCP instead of only local UDS
-* 🔲 CI with sanitizer builds / fuzzer for the framing layer
+* ✅ SHM ring buffers
+* ✅ SoapySDR source
+* ✅ WFM demod
+* ✅ Audio sink
+* ✅ Dummy
+* 🔄 ABI normalization (feeds + SHM + usage-tagged routing)
+* 🔄 Documentation unification
+* 🔲 Digital voice (DMR, TETRA, P25…)
+* 🔲 File/network IQ sources
+* 🔲 Remote access over TCP
+* 🔲 CI + sanitizers + fuzzers
 
-This repo is early, but already functionally interesting.
+Long-term vision:
 
-The long-term vision is:
-
-* make PhaseHound the "radio daemon" you leave running on a box,
-* configure/observe it with simple CLI or a thin web UI,
-* drop new demods as plugins instead of rebuilding the world.
-
+* PhaseHound becomes the “radio daemon” you leave running
+* You control it via CLI or a lightweight UI
+* DSP/decoders shipped as modular plugins
+* Serious RF signal chains built without monolithic SDR apps
 
 ## Contributing
 
-You are absolutely welcome to:
+Contributions welcome:
 
-* write a new addon (`src/addons/<yours>`),
-* improve demodulators,
-* add protocol decoders,
-* add sinks (recording, streaming, etc.),
-* improve security (peer credential check, socket perms),
-* improve performance (epoll backend, lock-free rings).
+* new demods
+* new sinks
+* protocol decoders
+* SHM optimizations
+* broker improvements
+* bugfixes / docs updates
 
-We try to keep the code clean C11 and readable, not "clever".
+Code stays clean C11 — no magic, no bloated frameworks.
 
-Please open an issue / PR if:
+Open an issue or PR if:
 
-* the docs drift,
-* the protocol needs clarity,
-* you built a cool addon.
+* docs or ABI drift
+* protocol needs clarity
+* you wrote a cool addon
 

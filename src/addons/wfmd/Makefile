@@ -10,6 +10,7 @@ SO := ph-lib$(NAME).so
 SRCS_SO := src/$(NAME).c \
 ../../../src/common.c \
 ../../../src/common/ctrlmsg.c \
+../../../src/common/ph_shm.c \
 
 all: $(SO)
 

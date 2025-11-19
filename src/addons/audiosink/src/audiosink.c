@@ -65,7 +65,8 @@ static void on_cmd(ph_ctrl_t *c, const char *line, void *u){
 
     if(strncmp(line,"help",4)==0){
         ph_reply(c, "{\"ok\":true,"
-                     "\"help\":\"help|start|stop|device <alsa>|subscribe <feed>|unsubscribe <feed>|status\"}");
+                     "\"help\":\"help|start|stop|device <alsa>|"
+                             "subscribe <usage> <feed>|unsubscribe <usage>|status\"}");
         return;
     }
     if(strcmp(line,"start")==0){
@@ -94,19 +95,45 @@ static void on_cmd(ph_ctrl_t *c, const char *line, void *u){
         return;
     }
     if(strncmp(line,"subscribe ",10)==0){
-        const char *f = line+10; while(*f==' '||*f=='\t') f++;
-        if(!*f){ ph_reply_err(c, "subscribe arg"); return; }
-        snprintf(S.current_feed, sizeof S.current_feed, "%s", f);
-        ph_subscribe(c->fd, f);
-        ph_reply_okf(c, "subscribed %s", f);
+        const char *p = line+10;
+        while(*p==' '||*p=='\t') p++;
+        char usage[32]={0};
+        char feed[128]={0};
+        if(sscanf(p,"%31s %127s", usage, feed)!=2){
+            ph_reply_err(c, "subscribe <usage> <feed>");
+            return;
+        }
+        /* For now audiosink only understands PCM source feeds */
+        if(strcmp(usage,"pcm-source")!=0 && strcmp(usage,"pcm")!=0 && strcmp(usage,"audio-source")!=0){
+            ph_reply_err(c, "unknown usage (expected pcm-source)");
+            return;
+        }
+        if(S.current_feed[0]){
+            ph_unsubscribe(c->fd, S.current_feed);
+            S.current_feed[0]='\0';
+        }
+        snprintf(S.current_feed, sizeof S.current_feed, "%s", feed);
+        ph_subscribe(c->fd, feed);
+        ph_reply_okf(c, "subscribed %s %s", usage, feed);
         return;
     }
     if(strncmp(line,"unsubscribe ",12)==0){
-        const char *f = line+12; while(*f==' '||*f=='\t') f++;
-        if(!*f){ ph_reply_err(c, "unsubscribe arg"); return; }
-        ph_unsubscribe(c->fd, f);
-        if(strcmp(S.current_feed, f)==0) S.current_feed[0]='\0';
-        ph_reply_okf(c, "unsubscribed %s", f);
+        const char *p = line+12;
+        while(*p==' '||*p=='\t') p++;
+        char usage[32]={0};
+        if(sscanf(p,"%31s", usage)!=1){
+            ph_reply_err(c, "unsubscribe <usage>");
+            return;
+        }
+        if(strcmp(usage,"pcm-source")!=0 && strcmp(usage,"pcm")!=0 && strcmp(usage,"audio-source")!=0){
+            ph_reply_err(c, "unknown usage (expected pcm-source)");
+            return;
+        }
+        if(S.current_feed[0]){
+            ph_unsubscribe(c->fd, S.current_feed);
+            S.current_feed[0]='\0';
+        }
+        ph_reply_okf(c, "unsubscribed %s", usage);
         return;
     }
     if(strcmp(line,"status")==0){
@@ -177,6 +204,7 @@ static void *cmd_thread(void *arg){
 const char* plugin_name(void){ return "audiosink"; }
 
 bool plugin_init(const plugin_ctx_t *ctx, plugin_caps_t *out){
+    PH_ENSURE_ABI(ctx);
     g_sock = ctx->sock_path;
     memset(&S, 0, sizeof S);
     snprintf(S.name, sizeof S.name, "audiosink");
@@ -186,10 +214,14 @@ bool plugin_init(const plugin_ctx_t *ctx, plugin_caps_t *out){
 
     static const char *CONS[] = { "audiosink.config.in", NULL };
     static const char *PROD[] = { "audiosink.config.out", NULL };
+
     if(out){
-        out->name="audiosink"; out->version="0.3.1";
+        out->caps_size = sizeof(*out);
+        out->name=plugin_name(); out->version="0.4.0";
         out->consumes=CONS;    out->produces=PROD;
+        out->feat_bits = PH_FEAT_PCM;
     }
+
     return true;
 }
 

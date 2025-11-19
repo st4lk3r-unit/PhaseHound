@@ -1,150 +1,137 @@
-# PhaseHound — Soapy Addon (Normalized ABI)
+# PhaseHound — soapy Addon (IQ Source)
 
-> **Status:** primary IQ source addon • Last updated: 2025-11-06
+> **Status:** SDR source addon • Last updated: 2025-11-19
 
-`soapy` is a normalized ABI addon that handles IQ acquisition from **SoapySDR-compatible** radio frontends.  
-It connects to any supported SDR hardware, configures RF parameters, and streams complex IQ data into shared memory (`memfd`).
+The `soapy` addon is a PhaseHound **source** that uses SoapySDR (RTL-SDR, UHD, etc.) to provide IQ samples.  
+It is responsible for:
 
-## 1. Purpose
+- discovering and selecting SDR devices,
+- configuring sample rate / center frequency / bandwidth,
+- streaming IQ into a shared memory ring,
+- announcing the IQ ring via `shm_map` on `soapy.IQ-info`.
 
-The Soapy addon provides the IQ source layer in the PhaseHound signal chain.  
-It enumerates devices, applies tuning parameters, and exports a high-bandwidth ring buffer for downstream demodulators (`wfmd`, `dmr`, etc.).
+It does **not** subscribe to other feeds; it only exposes control/config and produces IQ.
 
-It fully follows the unified control-plane ABI (`*.config.in/out`) and the normalized plugin lifecycle.
+---
 
-## 2. Feeds
+## 1. Feeds
 
-| Feed | Direction | Description |
-|------|------------|-------------|
-| `soapy.config.in`  | **in**  | Receives configuration and control commands. |
-| `soapy.config.out` | **out** | Publishes command replies and device status. |
-| `soapy.IQ-info`    | **out** | Publishes IQ stream descriptor (as `memfd`). |
+| Feed              | Direction | Description                                        |
+|-------------------|-----------|----------------------------------------------------|
+| `soapy.config.in` | **in**    | Configuration and control commands                |
+| `soapy.config.out`| **out**   | Replies, device list, and status text             |
+| `soapy.IQ-info`   | **out**   | Publishes IQ ring descriptor (`memfd`, SHM)       |
 
 In `plugin_register()`:
 
 ```c
-out->consumes = (const char*[]){ "soapy.config.in", NULL };
-out->produces = (const char*[]){ "soapy.config.out", "soapy.IQ-info", NULL };
+bool plugin_init(const plugin_ctx_t *ctx, plugin_caps_t *out) {
+    static const char *CONS[] = { "soapy.config.in", NULL };
+    static const char *PROD[] = { "soapy.config.out", "soapy.IQ-info", NULL };
+
+    out->name     = "soapy";
+    out->version  = "0.4.0";
+    out->consumes = CONS;
+    out->produces = PROD;
+    return true;
+}
 ````
 
-## 3. Lifecycle Hooks
+---
 
-```c
-bool plugin_init(const plugin_ctx_t *ctx, plugin_caps_t *out);
-bool plugin_start(void);
-void plugin_stop(void);
-```
+## 2. Control Commands
 
-The addon initializes a SoapySDR device on `select`, configures its frequency and rate, then activates the stream in `plugin_start()`.
+Commands are sent to `soapy.config.in`. Typical set:
 
-A dedicated RX thread continuously fills the shared IQ ring buffer.
+* `help`
+* `list`
+* `select <index>`
+* `set sr=<Hz> cf=<Hz> bw=<Hz>`
+* `start`
+* `stop`
+* `open` (republish IQ SHM descriptor)
 
-## 4. Control Commands
+### 2.1 Listing and selecting a device
 
-Commands on `soapy.config.in` (plain text or JSON):
-
-```
-help
-list                             # enumerate devices
-select <index>                   # open Soapy device by index
-set sr=<hz> cf=<hz> [bw=<hz>]    # apply sample rate / center freq / bandwidth
-fmt <cf32|cs16>                  # choose IQ sample format
-start                            # begin streaming and publish memfd
-stop                             # stop streaming
-open                             # re-publish the active memfd info
-status                           # print current device parameters
-subscribe <feed>
-unsubscribe <feed>
-```
-
-### Example usage
-
-```bash
-./ph-cli pub soapy.config.in list
+```sh
+./ph-cli pub soapy.config.in "list"
 ./ph-cli pub soapy.config.in "select 0"
-./ph-cli pub soapy.config.in "set sr=2400000 cf=96e6"
-./ph-cli pub soapy.config.in start
-./ph-cli sub soapy.config.out
 ```
 
-## 5. IQ Ring Buffer Layout
+### 2.2 Configuring and starting streaming
 
-Published through `soapy.IQ-info` as a memfd descriptor:
-
-```c
-struct phiq_hdr {
-    uint32_t magic;        // 'PHIQ'
-    uint32_t version;      // 1
-    _Atomic uint64_t seq;  // increments each write
-    _Atomic uint64_t wpos; // absolute write position
-    _Atomic uint64_t rpos; // absolute read position
-    uint32_t capacity;     // bytes in ring
-    uint32_t used;
-    uint32_t bytes_per_samp; // 8 (CF32) or 4 (CS16)
-    uint32_t channels;       // 1 (complex)
-    double sample_rate;
-    double center_freq;
-    uint32_t fmt;            // PHIQ_FMT_CF32 / PHIQ_FMT_CS16
-    uint8_t reserved[64];
-    uint8_t data[];
-};
+```sh
+./ph-cli pub soapy.config.in "set sr=2400000 cf=100.0e6 bw=1.5e6"
+./ph-cli pub soapy.config.in "start"
 ```
 
-## 6. Expected Output
+On `start`, the addon:
 
-* **IQ format:** interleaved complex (`float32` or `int16`)
-* **Default rate:** 2.4 MS/s
-* **Default center:** 100 MHz
-* **Channels:** 1
+* opens the device,
+* allocates an IQ ring in shared memory,
+* starts streaming IQ into that ring,
+* publishes a `shm_map` descriptor on `soapy.IQ-info` with the memfd.
 
-## 7. JSON Example (`soapy.IQ-info`)
+---
+
+## 3. IQ ring announcement
+
+The IQ SHM ring has its own header type (`phiq_hdr_t`) describing format, capacity, sample rate, center frequency, etc.
+A typical meta message looks like:
 
 ```json
 {
-  "fmt": 1,
-  "bytes_per_samp": 8,
-  "channels": 1,
-  "sample_rate": 2400000.0,
-  "center_freq": 96000000.0,
-  "capacity": 8388608
+  "type":    "publish",
+  "feed":    "soapy.IQ-info",
+  "subtype": "shm_map",
+  "proto":   "phasehound.iq-ring.v0",
+  "version": "0.1",
+  "size":    1048576,
+  "desc":    "Soapy IQ ring (cf=100.000 MHz,sr=2.400 Msps)",
+  "mode":    "r"
 }
 ```
 
-## 8. Build
+Downstream addons (such as `wfmd`) must:
 
-```bash
-make -C src/addons/soapy
-# or
-make addons
+* subscribe with the usage-tagged API:
+
+  ```sh
+  ./ph-cli pub wfmd.config.in "subscribe iq-source soapy.IQ-info"
+  ```
+
+* then map the memfd and begin reading IQ frames.
+
+If a new consumer subscribes later, you can force a **re-publish** of the IQ descriptor with:
+
+```sh
+./ph-cli pub soapy.config.in "open"
 ```
 
-Produces `libsoapy.so`.
+---
 
-## 9. Typical Pipeline
+## 4. Example in a full pipeline
 
+See WFMD and audiosink README for a full Soapy → WFMD → audiosink example.
+From Soapy’s perspective, it only needs to:
+
+```sh
+./ph-cli pub soapy.config.in "select 0"
+./ph-cli pub soapy.config.in "set sr=2400000 cf=100.0e6 bw=1.5e6"
+./ph-cli pub soapy.config.in "start"
 ```
-[SDR hardware → Soapy] → soapy.IQ-info → wfmd → audiosink
+
+and optionally:
+
+```sh
+./ph-cli pub soapy.config.in "open"   # republish IQ SHM if new subscribers arrive
 ```
 
-```bash
-./ph-cli pub soapy.config.in start
-./ph-cli pub wfmd.config.in start
-./ph-cli pub audiosink.config.in start
-```
+---
 
-## 10. Troubleshooting
+## 5. Notes
 
-| Problem            | Solution                                                   |
-| ------------------ | ---------------------------------------------------------- |
-| No devices listed  | Verify SoapySDR drivers installed (`SoapySDRUtil --find`). |
-| Silence downstream | Check IQ memfd published and wfmd subscribed.              |
-| Overruns           | Lower sample rate or increase ring buffer size.            |
+* `soapy` never calls `ph_subscribe()` — it is purely a **producer**.
+* The feed name `soapy.IQ-info` is stable and meant to be reused by any consumer.
+* IQ format (CF32 vs CS16, etc.) and ring layout are part of the `phiq_hdr_t` header; consumers should inspect it rather than assume fixed parameters.
 
-## 11. File Layout
-
-```
-src/addons/soapy/
-├── Makefile
-├── src/soapy.c
-└── README.md
-```

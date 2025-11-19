@@ -125,13 +125,19 @@ static void publish_txt(const char *feed, const char *txt){
 static void publish_iq_memfd(void){
     if(g_memfd<0 || !g_hdr) return;
     char js[POC_MAX_JSON];
-    int n = snprintf(js,sizeof js,
-        "{\"type\":\"publish\",\"feed\":\"%s\",\"encoding\":\"utf8\","
-         "\"data\":\"{\\\"fmt\\\":%u,\\\"bytes_per_samp\\\":%u,\\\"channels\\\":%u,"
-                     "\\\"sample_rate\\\":%.6f,\\\"center_freq\\\":%.6f,\\\"capacity\\\":%u}\"}",
+    /* Normalized SHM meta: phasehound.iq-ring.v0 */
+    int n = snprintf(js, sizeof js,
+        "{\"type\":\"publish\",\"feed\":\"%s\","
+        "\"subtype\":\"shm_map\","
+        "\"proto\":\"phasehound.iq-ring.v0\","
+        "\"version\":\"0.1\","
+        "\"size\":%u,"
+        "\"desc\":\"Soapy IQ ring (cf=%.3f MHz,sr=%.3f Msps)\","
+        "\"mode\":\"r\"}",
         FEED_IQ_INFO,
-        g_hdr->fmt, g_hdr->bytes_per_samp, g_hdr->channels,
-        g_hdr->sample_rate, g_hdr->center_freq, g_hdr->capacity);
+        g_hdr->capacity,
+        g_hdr->center_freq/1e6,
+        g_hdr->sample_rate/1e6);
     int fds[1]={ g_memfd };
     send_frame_json_with_fds(g_ctrl.fd, js, (size_t)n, fds, 1);
 }
@@ -411,15 +417,17 @@ static void *run(void *arg){
 const char* plugin_name(void){ return PLUGIN_NAME; }
 
 bool plugin_init(const plugin_ctx_t *ctx, plugin_caps_t *out){
-    if(!ctx || ctx->abi!=PLUGIN_ABI) return false;
+    PH_ENSURE_ABI(ctx);
     g_sock = ctx->sock_path;
-    static const char *cons[] = { "soapy.config.in", NULL };
-    static const char *prod[] = { "soapy.config.out", FEED_IQ_INFO, NULL };
+    static const char *CONS[] = { "soapy.config.in", NULL };
+    static const char *PROD[] = { "soapy.config.out", FEED_IQ_INFO, NULL };
     if(out){
+        out->caps_size = sizeof(*out);
         out->name = plugin_name();
-        out->version = "0.3.1";   // fix: proper create_shm_fd(tag, bytes) + strings.h
-        out->consumes = cons;
-        out->produces = prod;
+        out->version = "0.4.0";   // fix: proper create_shm_fd(tag, bytes) + strings.h
+        out->consumes = CONS;
+        out->produces = PROD;
+        out->feat_bits = PH_FEAT_IQ;
     }
     return true;
 }

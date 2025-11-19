@@ -121,6 +121,7 @@ static _Atomic int    g_tau_us  = 50;    // de-emphasis µs (50 EU / 75 US)
 /* IQ shared map */
 typedef struct { int memfd; phiq_hdr_t *hdr; size_t map_bytes; } iq_ring_t;
 static iq_ring_t g_iq = { .memfd=-1, .hdr=NULL, .map_bytes=0 };
+static char g_iq_feed[128] = {0};
 static void iq_ring_close(iq_ring_t *r){
     if(!r) return;
     if(r->hdr && r->hdr!=MAP_FAILED) munmap(r->hdr, r->map_bytes);
@@ -550,8 +551,15 @@ static void wfmd_publish_memfd(int fd){
     if(!g_ring.hdr) return;
     char js[POC_MAX_JSON];
     int n = snprintf(js, sizeof js,
-        "{\"type\":\"publish\",\"feed\":\"%s\",\"data\":\"info\",\"encoding\":\"utf8\"}",
-        "wfmd.audio-info");
+        "{\"type\":\"publish\",\"feed\":\"%s\","
+        "\"subtype\":\"shm_map\","
+        "\"proto\":\"phasehound.audio-ring.v0\","
+        "\"version\":\"0.1\","
+        "\"size\":%u,"
+        "\"desc\":\"WFMD audio ring (f32 mono)\","
+        "\"mode\":\"rw\"}",
+        "wfmd.audio-info",
+        g_ring.hdr->capacity);
     int fds[1] = { g_ring.memfd };
     send_frame_json_with_fds(fd, js, (size_t)n, fds, 1);
 }
@@ -564,12 +572,55 @@ static void on_cmd(ph_ctrl_t *c, const char *line, void *user){
     if(strncmp(line,"help",4)==0){
         ph_reply(c, "{\"ok\":true,"
                      "\"help\":\"help|open|start|stop|status|"
+                              "subscribe <usage> <feed>|unsubscribe <usage>|"
                               "gain <f>|swapiq <0|1>|flipq <0|1>|neg <0|1>|deemph <0|1>|"
                               "taps1 <odd>|debug <int>|foff <Hz>|bw <Hz>|tau <50|75>\"}");
         return;
     }
     if(strncmp(line,"open",4)==0){ wfmd_publish_memfd(c->fd); ph_reply_ok(c,"republished"); return; }
 
+    if(strncmp(line,"subscribe ",10)==0){
+        const char *p = line+10;
+        while(*p==' '||*p=='\t') p++;
+        char usage[32]={0};
+        char feed[128]={0};
+        if(sscanf(p,"%31s %127s", usage, feed)!=2){
+            ph_reply_err(c, "subscribe <usage> <feed>");
+            return;
+        }
+        if(strcmp(usage,"iq-source")!=0){
+            ph_reply_err(c, "unknown usage (expected iq-source)");
+            return;
+        }
+        if(g_iq_feed[0]){
+            ph_unsubscribe(c->fd, g_iq_feed);
+            g_iq_feed[0]='\0';
+        }
+        snprintf(g_iq_feed, sizeof g_iq_feed, "%s", feed);
+        ph_subscribe(c->fd, g_iq_feed);
+        ph_reply_okf(c, "iq-source=%s", g_iq_feed);
+        return;
+    }
+
+    if(strncmp(line,"unsubscribe ",12)==0){
+        const char *p = line+12;
+        while(*p==' '||*p=='\t') p++;
+        char usage[32]={0};
+        if(sscanf(p,"%31s", usage)!=1){
+            ph_reply_err(c, "unsubscribe <usage>");
+            return;
+        }
+        if(strcmp(usage,"iq-source")!=0){
+            ph_reply_err(c, "unknown usage (expected iq-source)");
+            return;
+        }
+        if(g_iq_feed[0]){
+            ph_unsubscribe(c->fd, g_iq_feed);
+            g_iq_feed[0]='\0';
+        }
+        ph_reply_ok(c, "unsubscribed iq-source");
+        return;
+    }
     if(strncmp(line,"swapiq ",7)==0){ int v=atoi(line+7); g_swapiq=(v!=0); ph_reply_okf(c,"swapiq=%d",(int)g_swapiq); return; }
     if(strncmp(line,"flipq ",6)==0){ int v=atoi(line+6); g_flipq=(v!=0);  ph_reply_okf(c,"flipq=%d",(int)g_flipq);  return; }
     if(strncmp(line,"neg ",4)==0){   int v=atoi(line+4); g_neg=(v!=0);     ph_reply_okf(c,"neg=%d",(int)g_neg);      return; }
@@ -645,9 +696,6 @@ static void *run(void *arg){
     ph_ctrl_advertise(&g_ctrl);
     ph_create_feed(fd, "wfmd.audio-info");
 
-    /* subscribe to IQ-info produced by soapy addon */
-    ph_subscribe(fd, "soapy.IQ-info");
-
     /* setup audio ring and publish its FD once */
     const double audio_fs = 48000.0;
     const size_t audio_sec = 2;
@@ -684,7 +732,7 @@ static void *run(void *arg){
             const char *f = strchr(p_feed, ':'); if(f){ f++; while(*f==' '||*f=='\"'){ if(*f=='\"'){ f++; break; } f++; }
                 size_t i=0; while(*f && *f!='\"' && i+1<sizeof feed){ feed[i++]=*f++; } feed[i]='\0'; }
 
-            if(strcmp(type,"publish")==0 && strcmp(feed,"soapy.IQ-info")==0){
+            if(strcmp(type,"publish")==0 && g_iq_feed[0] && strcmp(feed,g_iq_feed)==0){
                 if(nfds==1 && infd>=0){
                     iq_ring_close(&g_iq);
                     struct stat st;
@@ -716,15 +764,17 @@ static void *run(void *arg){
 const char* plugin_name(void){ return "wfmd"; }
 
 bool plugin_init(const plugin_ctx_t *ctx, plugin_caps_t *out){
-    if(!ctx || ctx->abi!=PLUGIN_ABI) return false;
-    static const char *cons[] = { "wfmd.config.in", "soapy.IQ-info", NULL };
-    static const char *prod[] = { "wfmd.config.out","wfmd.audio-info", NULL };
+    PH_ENSURE_ABI(ctx);
+    static const char *CONS[] = { "wfmd.config.in", NULL };
+    static const char *PROD[] = { "wfmd.config.out","wfmd.audio-info", NULL };
     g_sock = ctx->sock_path;
     if(out){
+        out->caps_size = sizeof(*out);
         out->name = plugin_name();
-        out->version = "0.3.1";               // anti-alias fix + limiter reorder + abs ring math + CS16 + gating
-        out->consumes = cons;
-        out->produces = prod;
+        out->version = "0.4.0";
+        out->consumes = CONS;
+        out->produces = PROD;
+        out->feat_bits = PH_FEAT_PCM;
     }
     return true;
 }
