@@ -28,38 +28,12 @@
 #include "common.h"
 #include "ctrlmsg.h"   // control-plane helpers
 #include "ph_stream.h"
-
-#ifndef MFD_CLOEXEC
-#define MFD_CLOEXEC 0x0001
-#endif
+#include "ph_shm.h"
 
 #define PLUGIN_NAME "soapy"
 
 /* feeds (control-plane helpers auto-create soapy.config.{in,out}) */
 #define FEED_IQ_INFO  "soapy.IQ-info"
-
-/* ---------- small compat for memfd/shm_open ---------- */
-static int xmemfd_create(const char *name, unsigned int flags){
-#ifdef SYS_memfd_create
-    return (int)syscall(SYS_memfd_create, name, flags);
-#else
-    (void)name; (void)flags; errno=ENOSYS; return -1;
-#endif
-}
-static int create_shm_fd(const char *tag, size_t bytes){
-    int fd = xmemfd_create(tag, MFD_CLOEXEC);
-    if(fd>=0){
-        if(ftruncate(fd, (off_t)bytes)<0){ int e=errno; close(fd); errno=e; return -1; }
-        return fd;
-    }
-    char name[64]; snprintf(name, sizeof name, "/%s-%d", tag, getpid());
-    fd = shm_open(name, O_CREAT|O_RDWR, 0600);
-    if(fd<0) return -1;
-    shm_unlink(name);
-    if(ftruncate(fd, (off_t)bytes)<0){ int e=errno; close(fd); errno=e; return -1; }
-    return fd;
-}
-static void sleep_ms(int ms){ struct timespec ts={ ms/1000, (ms%1000)*1000000L }; nanosleep(&ts,NULL); }
 
 /* ---------- addon state ---------- */
 static const char *g_sock = NULL;
@@ -142,7 +116,7 @@ static int iq_ring_open(size_t capacity_bytes, double sr, double cf, phiq_fmt_t 
     if(g_memfd>=0){ close(g_memfd); g_memfd=-1; }
 
     size_t total = sizeof(phiq_hdr_t) + capacity_bytes;
-    int fd = create_shm_fd("ph-iq", total);
+    int fd = ph_shm_create_fd("ph-iq", total);
     if(fd<0) return -1;
     void *map = mmap(NULL, total, PROT_READ|PROT_WRITE, MAP_SHARED, fd, 0);
     if(!map || map==MAP_FAILED){ int e=errno; close(fd); errno=e; return -1; }
@@ -232,7 +206,7 @@ static void *rx_thread(void *arg){
     void *buffs[1]={ tmp };
 
     while(atomic_load(&g_run)){
-        if(!atomic_load(&g_active) || !g_dev.rx || !g_hdr){ sleep_ms(10); continue; }
+        if(!atomic_load(&g_active) || !g_dev.rx || !g_hdr){ ph_msleep(10); continue; }
 
         int flags=0; long long ts=0;
         int elems;
@@ -375,7 +349,7 @@ static void on_cmd(ph_ctrl_t *c, const char *line, void *user){
 static void *run(void *arg){
     (void)arg;
     int fd=-1;
-    for(int i=0;i<50;i++){ fd = uds_connect(g_sock?g_sock:PH_SOCK_PATH); if(fd>=0) break; sleep_ms(100); }
+    for(int i=0;i<50;i++){ fd = uds_connect(g_sock?g_sock:PH_SOCK_PATH); if(fd>=0) break; ph_msleep(100); }
     if(fd<0) return NULL;
 
     ph_ctrl_init(&g_ctrl, fd, "soapy");     // creates soapy.config.{in,out} and subscribes to .in

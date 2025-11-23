@@ -369,3 +369,15 @@ int recv_frame_json_with_fds(int fd, char *json_out, size_t outcap, int *fds_out
     if(nfds_inout) *nfds_inout = gotfds;
     return (int)len;
 }
+
+void ph_msleep(int ms){
+    struct timespec ts;
+    if (ms <= 0) {
+        ts.tv_sec = 0;
+        ts.tv_nsec = 0;
+    } else {
+        ts.tv_sec  = ms / 1000;
+        ts.tv_nsec = (long)(ms % 1000) * 1000000L;
+    }
+    nanosleep(&ts, NULL);
+}

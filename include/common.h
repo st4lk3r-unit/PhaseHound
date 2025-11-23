@@ -39,4 +39,7 @@ void feedtab_list(feedtab_t *t, int fd);
 int json_get_string(const char *json, const char *key, char *out, size_t outcap);
 int json_get_type(const char *json, char *out, size_t outcap);
 
+// Misc helpers
+void ph_msleep(int ms);
+
 #endif

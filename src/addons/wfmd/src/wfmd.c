@@ -24,36 +24,11 @@
 #include "common.h"
 #include "ctrlmsg.h"  // shared helpers (advertise/dispatch/replies)
 #include "ph_stream.h"
+#include "ph_shm.h"
 
-#ifndef MFD_CLOEXEC
-#define MFD_CLOEXEC 0x0001
-#endif
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
 #endif
-
-/* ---------- small compat for shared memory fd (memfd/shm_open fallback) ---------- */
-static int xmemfd_create(const char *name, unsigned int flags){
-#ifdef SYS_memfd_create
-    return (int)syscall(SYS_memfd_create, name, flags);
-#else
-    (void)name; (void)flags; errno = ENOSYS; return -1;
-#endif
-}
-static int create_shm_fd(const char *tag, size_t bytes){
-    int fd = xmemfd_create(tag, MFD_CLOEXEC);
-    if(fd>=0){
-        if(ftruncate(fd, (off_t)bytes)<0){ int e=errno; close(fd); errno=e; return -1; }
-        return fd;
-    }
-    char name[64]; snprintf(name, sizeof name, "/%s-%d", tag, getpid());
-    fd = shm_open(name, O_CREAT|O_RDWR, 0600);
-    if(fd<0) return -1;
-    shm_unlink(name);
-    if(ftruncate(fd, (off_t)bytes)<0){ int e=errno; close(fd); errno=e; return -1; }
-    return fd;
-}
-static void sleep_ms(int ms){ struct timespec ts={ ms/1000, (ms%1000)*1000000L }; nanosleep(&ts,NULL); }
 
 /* ---------- global state ---------- */
 static _Atomic int g_run = 0;
@@ -102,7 +77,9 @@ static void ring_close(ring_t *r){
 }
 static int ring_open(ring_t *r, size_t audio_capacity_bytes, double fs){
     memset(r, 0, sizeof *r);
-    int fd = create_shm_fd("ph-wfmd-audio", sizeof(phau_hdr_t)+audio_capacity_bytes);
+    /* unified SHM creation through common subsystem */
+    int fd = ph_shm_create_fd("ph-wfmd-audio",
+                              sizeof(phau_hdr_t) + audio_capacity_bytes);
     if(fd<0) return -1;
     void *map = mmap(NULL, sizeof(phau_hdr_t)+audio_capacity_bytes,
                      PROT_READ|PROT_WRITE, MAP_SHARED, fd, 0);
@@ -663,7 +640,7 @@ static void on_cmd(ph_ctrl_t *c, const char *line, void *user){
 static void *run(void *arg){
     (void)arg;
     int fd = -1;
-    for(int i=0;i<50;i++){ fd = uds_connect(g_sock ? g_sock : PH_SOCK_PATH); if(fd>=0) break; sleep_ms(100); }
+    for(int i=0;i<50;i++){ fd = uds_connect(g_sock ? g_sock : PH_SOCK_PATH); if(fd>=0) break; ph_msleep(100); }
     if(fd<0) return NULL;
 
     /* control-plane advertise */

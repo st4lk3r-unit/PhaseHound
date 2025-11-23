@@ -33,11 +33,6 @@ typedef struct {
 
 static dummy_sub_t g_subs[4];
 
-static void sleep_ms(int ms) {
-    struct timespec ts = { ms / 1000, (ms % 1000) * 1000000L };
-    nanosleep(&ts, NULL);
-}
-
 /* Tiny JSON escaper (for ph_publish text payloads) */
 static void publish_utf8(int fd, const char *feed, const char *msg) {
     char esc[POC_MAX_JSON / 2];
@@ -168,7 +163,7 @@ static void on_cmd(ph_ctrl_t *c, const char *line, void *user) {
 
         /* Periodic "ready" notifications */
         for (int r = 0; r < 3 && atomic_load(&g_run); r++) {
-            sleep_ms(200);
+            ph_msleep(200);
             uint64_t seq = 0;
             (void)ph_shm_publish(&g_demo, g_demo.hdr->data, g_demo.hdr->used, &seq);
             int l2 = snprintf(jsmap, sizeof jsmap,
@@ -194,7 +189,7 @@ static void *run(void *arg) {
         fd = uds_connect(g_sock ? g_sock : PH_SOCK_PATH);
         if (fd >= 0)
             break;
-        sleep_ms(100);
+        ph_msleep(100);
     }
     if (fd < 0)
         return NULL;

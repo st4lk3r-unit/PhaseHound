@@ -17,30 +17,27 @@
 static audiosink_t S;
 static const char *g_sock = NULL;
 
-/* small sleep */
-static void msleep(int ms){ struct timespec ts={ ms/1000, (ms%1000)*1000000L }; nanosleep(&ts,NULL); }
-
 /* ---- playback thread ---- */
 static void *play_thread(void *arg){
     (void)arg;
     float framebuf[2048];
 
     while(atomic_load(&S.play_run)){
-        if(!S.hdr || !S.pcm){ msleep(5); continue; }
+        if(!S.hdr || !S.pcm){ ph_msleep(5); continue; }
 
         size_t nframes = au_ring_pop_f32(&S, framebuf, sizeof(framebuf)/sizeof(framebuf[0]));
-        if(nframes == 0){ msleep(2); continue; }
+        if(nframes == 0){ ph_msleep(2); continue; }
 
         snd_pcm_sframes_t wrote = snd_pcm_writei(S.pcm, framebuf, nframes);
         if(wrote < 0){
             if(wrote == -EPIPE){ snd_pcm_prepare(S.pcm); continue; }
             if(wrote == -ESTRPIPE){
-                while((wrote = snd_pcm_resume(S.pcm)) == -EAGAIN) msleep(1);
+                while((wrote = snd_pcm_resume(S.pcm)) == -EAGAIN) ph_msleep(1);
                 if(wrote < 0) snd_pcm_prepare(S.pcm);
                 continue;
             }
             fprintf(stderr,"[audiosink] writei: %s\n", snd_strerror(wrote));
-            msleep(5);
+            ph_msleep(5);
         }
     }
     return NULL;

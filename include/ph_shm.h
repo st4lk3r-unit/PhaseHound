@@ -34,6 +34,8 @@ typedef struct ph_shm {
     ph_shm_v0_t *hdr;     /* mapped header */
 } ph_shm_t;
 
+/* Low-level helper: create a sealed shared-memory fd of given size (header+payload). */
+int  ph_shm_create_fd(const char *debug_tag, size_t map_bytes);
 /* Producer: create sealed shared memory big enough for `payload_bytes` */
 int  ph_shm_create(ph_shm_t *s, const char *debug_tag, size_t payload_bytes);
 /* Producer: unmap + close */

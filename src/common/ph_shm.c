@@ -77,13 +77,8 @@ static int map_fd_rw(int fd, size_t map_bytes, void **out) {
 }
 
 /* ---------------- public API ---------------- */
-
-int ph_shm_create(ph_shm_t *s, const char *debug_tag, size_t payload_bytes) {
-    if (!s || payload_bytes == 0) { errno = EINVAL; return -1; }
-    memset(s, 0, sizeof(*s));
-    s->fd = -1;
-
-    size_t map_bytes = sizeof(ph_shm_v0_t) + payload_bytes;
+int ph_shm_create_fd(const char *debug_tag, size_t map_bytes) {
+    if (map_bytes == 0) { errno = EINVAL; return -1; }
 
     int fd = x_memfd_create(debug_tag ? debug_tag : "phshm");
     char shm_name[128] = {0};
@@ -96,10 +91,21 @@ int ph_shm_create(ph_shm_t *s, const char *debug_tag, size_t payload_bytes) {
         if (fd < 0) return -1;
     }
 
-    if (set_cloexec(fd) != 0) { int e=errno; close(fd); errno=e; return -1; }
+    if (set_cloexec(fd) != 0) {
+        int e = errno;
+        close(fd);
+        errno = e;
+        return -1;
+    }
 
     // Resize backing
-    if (ftruncate(fd, (off_t)map_bytes) != 0) { int e=errno; close(fd); if(using_posix) shm_unlink(shm_name); errno=e; return -1; }
+    if (ftruncate(fd, (off_t)map_bytes) != 0) {
+        int e = errno;
+        close(fd);
+        if (using_posix) shm_unlink(shm_name);
+        errno = e;
+        return -1;
+    }
 
 #if defined(__linux__)
     // Try to preallocate to avoid SIGBUS on later writes (best-effort)
@@ -107,26 +113,42 @@ int ph_shm_create(ph_shm_t *s, const char *debug_tag, size_t payload_bytes) {
     // (void)posix_fallocate(fd, 0, (off_t)map_bytes);
 #endif
 
+    // POSIX shm: unlink name immediately (anonymous after map)
+    if (using_posix) shm_unlink(shm_name);
+
+    return fd;
+}
+
+int ph_shm_create(ph_shm_t *s, const char *debug_tag, size_t payload_bytes) {
+    if (!s || payload_bytes == 0) { errno = EINVAL; return -1; }
+    memset(s, 0, sizeof(*s));
+    s->fd = -1;
+
+    size_t map_bytes = sizeof(ph_shm_v0_t) + payload_bytes;
+
+    int fd = ph_shm_create_fd(debug_tag, map_bytes);
+    if (fd < 0) return -1;
+
     void *base = NULL;
     if (map_fd_rw(fd, map_bytes, &base) != 0) {
-        int e=errno; close(fd); if(using_posix) shm_unlink(shm_name); errno=e; return -1;
+        int e = errno;
+        close(fd);
+        errno = e;
+        return -1;
     }
 
-    // Initialize header
-    ph_shm_v0_t *hdr = (ph_shm_v0_t*)base;
-    hdr->magic     = PH_SHM_MAGIC;
+    ph_shm_v0_t *hdr = (ph_shm_v0_t *)base;
+    memset(hdr, 0, sizeof(*hdr));
+    hdr->magic    = PH_SHM_MAGIC;
     hdr->ver_major = PH_SHM_VMAJOR;
     hdr->ver_minor = PH_SHM_VMINOR;
     atomic_store_explicit(&hdr->seq, 0, memory_order_relaxed);
-    hdr->used      = 0;
-    hdr->capacity  = (uint32_t)payload_bytes;
+    hdr->used     = 0;
+    hdr->capacity = (uint32_t)payload_bytes;
 
-    // Optionally unlink POSIX shm name immediately (anonymous shm after map)
-    if (using_posix) shm_unlink(shm_name);
-
-    s->fd = fd;
+    s->fd        = fd;
     s->map_bytes = map_bytes;
-    s->hdr = hdr;
+    s->hdr       = hdr;
     return 0;
 }
 
