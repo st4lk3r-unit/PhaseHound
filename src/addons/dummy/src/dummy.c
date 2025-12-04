@@ -9,6 +9,7 @@
 #include "plugin.h"
 #include "common.h"
 #include "ctrlmsg.h"
+#include "ph_subs.h"
 #include "ph_shm.h"
 
 #include <stdio.h>
@@ -33,12 +34,61 @@ typedef struct {
 
 static dummy_sub_t g_subs[4];
 
+static int dummy_subscribe_cb(void *user, const char *usage, const char *feed) {
+    ph_ctrl_t *c = (ph_ctrl_t *)user;
+    if (!c || !usage || !feed) return -1;
+
+    int slot = -1;
+    for (int i = 0; i < (int)(sizeof g_subs / sizeof g_subs[0]); ++i) {
+        if (g_subs[i].usage[0] && strcmp(g_subs[i].usage, usage) == 0) {
+            slot = i;
+            break;
+        }
+        if (slot == -1 && g_subs[i].usage[0] == 0)
+            slot = i;
+    }
+    if (slot < 0)
+        return -1;
+
+    if (g_subs[slot].feed[0]) {
+        ph_unsubscribe(c->fd, g_subs[slot].feed);
+    }
+    snprintf(g_subs[slot].usage, sizeof g_subs[slot].usage, "%s", usage);
+    snprintf(g_subs[slot].feed, sizeof g_subs[slot].feed, "%s", feed);
+    ph_subscribe(c->fd, feed);
+    return 0;
+}
+
+static int dummy_unsubscribe_cb(void *user, const char *usage) {
+    ph_ctrl_t *c = (ph_ctrl_t *)user;
+    (void)c;
+    if (!usage) return -1;
+
+    for (int i = 0; i < (int)(sizeof g_subs / sizeof g_subs[0]); ++i) {
+        if (g_subs[i].usage[0] && strcmp(g_subs[i].usage, usage) == 0) {
+            if (g_subs[i].feed[0]) {
+                ph_unsubscribe(c->fd, g_subs[i].feed);
+            }
+            g_subs[i].usage[0] = '\0';
+            g_subs[i].feed[0]  = '\0';
+            return 0;
+        }
+    }
+    return -1;
+}
+
+
 /* Tiny JSON escaper (for ph_publish text payloads) */
 /* --- command handler --- */
 static void on_cmd(ph_ctrl_t *c, const char *line, void *user) {
     (void)user;
     while (*line == ' ' || *line == '\t')
         line++;
+
+    if (ph_handle_subscribe_cmd(c, line, dummy_subscribe_cb, c))
+        return;
+    if (ph_handle_unsubscribe_cmd(c, line, dummy_unsubscribe_cb, c))
+        return;
 
     if (strncmp(line, "help", 4) == 0) {
         ph_reply(c,
@@ -50,62 +100,6 @@ static void on_cmd(ph_ctrl_t *c, const char *line, void *user) {
 
     if (strncmp(line, "ping", 4) == 0) {
         ph_reply_ok(c, "pong");
-        return;
-    }
-
-    if (strncmp(line, "subscribe ", 10) == 0) {
-        const char *p = line + 10;
-        while (*p == ' ' || *p == '\t')
-            p++;
-        char usage[32] = {0};
-        char feed[128] = {0};
-        if (sscanf(p, "%31s %127s", usage, feed) != 2) {
-            ph_reply_err(c, "subscribe <usage> <feed>");
-            return;
-        }
-        int slot = -1;
-        for (int i = 0; i < (int)(sizeof g_subs / sizeof g_subs[0]); ++i) {
-            if (g_subs[i].usage[0] && strcmp(g_subs[i].usage, usage) == 0) {
-                slot = i;
-                break;
-            }
-            if (slot == -1 && g_subs[i].usage[0] == 0)
-                slot = i;
-        }
-        if (slot < 0) {
-            ph_reply_err(c, "too many subscriptions");
-            return;
-        }
-        if (g_subs[slot].feed[0]) {
-            ph_unsubscribe(c->fd, g_subs[slot].feed);
-        }
-        snprintf(g_subs[slot].usage, sizeof g_subs[slot].usage, "%s", usage);
-        snprintf(g_subs[slot].feed, sizeof g_subs[slot].feed, "%s", feed);
-        ph_subscribe(c->fd, feed);
-        ph_reply_okf(c, "subscribed %s %s", usage, feed);
-        return;
-    }
-
-    if (strncmp(line, "unsubscribe ", 12) == 0) {
-        const char *p = line + 12;
-        while (*p == ' ' || *p == '\t')
-            p++;
-        char usage[32] = {0};
-        if (sscanf(p, "%31s", usage) != 1) {
-            ph_reply_err(c, "unsubscribe <usage>");
-            return;
-        }
-        for (int i = 0; i < (int)(sizeof g_subs / sizeof g_subs[0]); ++i) {
-            if (g_subs[i].usage[0] && strcmp(g_subs[i].usage, usage) == 0) {
-                if (g_subs[i].feed[0])
-                    ph_unsubscribe(c->fd, g_subs[i].feed);
-                g_subs[i].usage[0] = '\0';
-                g_subs[i].feed[0] = '\0';
-                ph_reply_okf(c, "unsubscribed %s", usage);
-                return;
-            }
-        }
-        ph_reply_err(c, "unknown usage");
         return;
     }
 

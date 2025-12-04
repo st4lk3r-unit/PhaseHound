@@ -13,7 +13,8 @@ INCS       := $(addprefix -I,$(INC_DIRS))
 SRCS_ADDON  := src/$(ADDON).c
 SRCS_COMMON := $(ROOT)src/common.c \
                $(ROOT)src/common/ctrlmsg.c \
-               $(ROOT)src/common/ph_shm.c
+               $(ROOT)src/common/ph_shm.c \
+               $(ROOT)src/common/ph_subs.c
 SRCS        := $(SRCS_ADDON) $(SRCS_COMMON)
 
 OBJS := $(SRCS:.c=.o)

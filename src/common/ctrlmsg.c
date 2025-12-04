@@ -69,28 +69,35 @@ void ph_ctrl_advertise(ph_ctrl_t *c) {
 
 /* ---- replies ---- */
 
+
 void ph_reply(ph_ctrl_t *c, const char *json_obj) {
     /* json_obj must start with { and end with } */
     ph_publish(c->fd, c->feed_out, json_obj);
 }
 
 void ph_reply_ok(ph_ctrl_t *c, const char *msg) {
-    char js[512];
-    snprintf(js, sizeof js, "{\"ok\":true,\"msg\":\"%s\"}", msg ? msg : "ok");
+    char esc[512];
+    ph_json_escape_string(msg ? msg : "ok", esc, sizeof esc);
+    char js[768];
+    snprintf(js, sizeof js, "{\"ok\":true,\"msg\":\"%s\"}", esc);
     ph_publish(c->fd, c->feed_out, js);
 }
 
 void ph_reply_err(ph_ctrl_t *c, const char *msg) {
-    char js[512];
-    snprintf(js, sizeof js, "{\"ok\":false,\"err\":\"%s\"}", msg ? msg : "err");
+    char esc[512];
+    ph_json_escape_string(msg ? msg : "err", esc, sizeof esc);
+    char js[768];
+    snprintf(js, sizeof js, "{\"ok\":false,\"err\":\"%s\"}", esc);
     ph_publish(c->fd, c->feed_out, js);
 }
 
 static void vreply_fmt(ph_ctrl_t *c, bool ok, const char *fmt, va_list ap) {
     char payload[768];
     vsnprintf(payload, sizeof payload, fmt ? fmt : "", ap);
+    char esc[768];
+    ph_json_escape_string(payload, esc, sizeof esc);
     char js[900];
-    snprintf(js, sizeof js, "{\"ok\":%s,\"msg\":\"%s\"}", ok ? "true":"false", payload);
+    snprintf(js, sizeof js, "{\"ok\":%s,\"msg\":\"%s\"}", ok ? "true":"false", esc);
     ph_publish(c->fd, c->feed_out, js);
 }
 
@@ -106,15 +113,44 @@ void ph_reply_errf(ph_ctrl_t *c, const char *fmt, ...) {
    Expects frames shaped like:
    {"type":"command","feed":"<name>.config.in","data":"<cmdline>"}
 */
-static const char *json_get(const char *js, const char *key, char *out, size_t outsz) {
-    /* super-lightweight extractor to avoid pulling a full JSON lib here */
+static const char *json_get(const char *js, const char *key, char *out, size_t outsz)
+{
+    /* Super-lightweight extractor: ONLY for our own flat control frames.
+       Not a general JSON parser. Returns NULL on any structural weirdness
+       or potential overflow. */
+    if (!js || !key || !out || outsz == 0)
+        return NULL;
+
     const char *p = strstr(js, key);
-    if (!p) return NULL;
-    p = strchr(p, ':'); if (!p) return NULL; p++;
-    while (*p==' '||*p=='\"') { if (*p=='\"') { p++; break; } p++; }
-    size_t i=0;
-    while (*p && *p!='\"' && *p!='\n' && *p!='\r' && i+1<outsz) out[i++]=*p++;
-    out[i]='\0';
+    if (!p)
+        return NULL;
+
+    p = strchr(p, ':');
+    if (!p)
+        return NULL;
+    p++;
+
+    /* Skip whitespace */
+    while (*p == ' ' || *p == '	')
+        p++;
+
+    /* Optional opening quote */
+    if (*p == '"')
+        p++;
+
+    size_t i = 0;
+    while (*p && *p != '"' && (unsigned char)*p != 10 && (unsigned char)*p != 13 && i + 1 < outsz) {
+        out[i++] = *p++;
+    }
+
+    if (!*p) {
+        /* Unterminated or malformed; don't trust output */
+        if (outsz > 0)
+            out[0] = 0;
+        return NULL;
+    }
+
+    out[i] = 0;
     return out;
 }
 

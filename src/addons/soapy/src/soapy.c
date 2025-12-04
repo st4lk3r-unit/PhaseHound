@@ -10,6 +10,7 @@
 #include <fcntl.h>
 
 #include <stdatomic.h>
+#include <limits.h>
 #include <pthread.h>
 #include <errno.h>
 #include <stdint.h>
@@ -30,6 +31,17 @@
 #include "ph_stream.h"
 #include "ph_shm.h"
 #include "ph_subs.h"
+
+static bool parse_int(const char *s, int *out) {
+    if (!s || !out) return false;
+    char *end = NULL;
+    long v = strtol(s, &end, 10);
+    if (end == s) return false;
+    if (v < INT_MIN || v > INT_MAX) return false;
+    *out = (int)v;
+    return true;
+}
+
 
 #define PLUGIN_NAME "soapy"
 
@@ -297,7 +309,8 @@ static void on_cmd(ph_ctrl_t *c, const char *line, void *user){
     }
 
     if(strncmp(line,"select ",7)==0){
-        int idx = atoi(line+7);
+        int idx = -1;
+        if (!parse_int(line+7, &idx)) { ph_reply_err(c, "invalid index"); return; }
         if(soapy_open_idx(idx)==0){ soapy_apply_params(); ph_reply_ok(c,"selected"); }
         else ph_reply_err(c,"select failed");
         return;

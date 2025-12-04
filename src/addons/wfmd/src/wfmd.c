@@ -7,6 +7,20 @@
 #include <sys/uio.h>
 #include <sys/stat.h>
 #include <fcntl.h>
+#include <stdbool.h>
+#include <limits.h>
+#include <stdlib.h>
+
+
+static bool parse_int(const char *s, int *out) {
+    if (!s || !out) return false;
+    char *end = NULL;
+    long v = strtol(s, &end, 10);
+    if (end == s) return false;
+    if (v < INT_MIN || v > INT_MAX) return false;
+    *out = (int)v;
+    return true;
+}
 
 #include <math.h>
 #include <stdatomic.h>
@@ -18,11 +32,13 @@
 #include <stdlib.h>
 #include <time.h>
 #include <stdint.h>
+#include <limits.h>
 
 #include "ph_uds_protocol.h"
 #include "plugin.h"
 #include "common.h"
 #include "ctrlmsg.h"  // shared helpers (advertise/dispatch/replies)
+#include "ph_subs.h"
 #include "ph_stream.h"
 #include "ph_shm.h"
 
@@ -58,6 +74,39 @@ static _Atomic int    g_tau_us  = 50;    // de-emphasis µs (50 EU / 75 US)
 typedef struct { int memfd; phiq_hdr_t *hdr; size_t map_bytes; } iq_ring_t;
 static iq_ring_t g_iq = { .memfd=-1, .hdr=NULL, .map_bytes=0 };
 static char g_iq_feed[128] = {0};
+
+static int wfmd_subscribe_cb(void *user, const char *usage, const char *feed) {
+    ph_ctrl_t *c = (ph_ctrl_t *)user;
+    (void)c;
+    if (!usage || !feed) return -1;
+
+    if (strcmp(usage, "iq-source") != 0)
+        return -1;
+
+    if (g_iq_feed[0]) {
+        ph_unsubscribe(g_ctrl.fd, g_iq_feed);
+        g_iq_feed[0] = '\0';
+    }
+    snprintf(g_iq_feed, sizeof g_iq_feed, "%s", feed);
+    ph_subscribe(g_ctrl.fd, feed);
+    return 0;
+}
+
+static int wfmd_unsubscribe_cb(void *user, const char *usage) {
+    ph_ctrl_t *c = (ph_ctrl_t *)user;
+    (void)c;
+    if (!usage) return -1;
+
+    if (strcmp(usage, "iq-source") != 0)
+        return -1;
+
+    if (g_iq_feed[0]) {
+        ph_unsubscribe(g_ctrl.fd, g_iq_feed);
+        g_iq_feed[0] = '\0';
+    }
+    return 0;
+}
+
 static void iq_ring_close(iq_ring_t *r){
     if(!r) return;
     if(r->hdr && r->hdr!=MAP_FAILED) munmap(r->hdr, r->map_bytes);
@@ -521,6 +570,11 @@ static void on_cmd(ph_ctrl_t *c, const char *line, void *user){
     (void)user;
     while(*line==' '||*line=='\t') line++;
 
+    if (ph_handle_subscribe_cmd(c, line, wfmd_subscribe_cb, c))
+        return;
+    if (ph_handle_unsubscribe_cmd(c, line, wfmd_unsubscribe_cb, c))
+        return;
+
     if(strncmp(line,"help",4)==0){
         ph_reply(c, "{\"ok\":true,"
                      "\"help\":\"help|open|start|stop|status|"
@@ -531,57 +585,15 @@ static void on_cmd(ph_ctrl_t *c, const char *line, void *user){
     }
     if(strncmp(line,"open",4)==0){ wfmd_publish_memfd(c->fd); ph_reply_ok(c,"republished"); return; }
 
-    if(strncmp(line,"subscribe ",10)==0){
-        const char *p = line+10;
-        while(*p==' '||*p=='\t') p++;
-        char usage[32]={0};
-        char feed[128]={0};
-        if(sscanf(p,"%31s %127s", usage, feed)!=2){
-            ph_reply_err(c, "subscribe <usage> <feed>");
-            return;
-        }
-        if(strcmp(usage,"iq-source")!=0){
-            ph_reply_err(c, "unknown usage (expected iq-source)");
-            return;
-        }
-        if(g_iq_feed[0]){
-            ph_unsubscribe(c->fd, g_iq_feed);
-            g_iq_feed[0]='\0';
-        }
-        snprintf(g_iq_feed, sizeof g_iq_feed, "%s", feed);
-        ph_subscribe(c->fd, g_iq_feed);
-        ph_reply_okf(c, "iq-source=%s", g_iq_feed);
-        return;
-    }
-
-    if(strncmp(line,"unsubscribe ",12)==0){
-        const char *p = line+12;
-        while(*p==' '||*p=='\t') p++;
-        char usage[32]={0};
-        if(sscanf(p,"%31s", usage)!=1){
-            ph_reply_err(c, "unsubscribe <usage>");
-            return;
-        }
-        if(strcmp(usage,"iq-source")!=0){
-            ph_reply_err(c, "unknown usage (expected iq-source)");
-            return;
-        }
-        if(g_iq_feed[0]){
-            ph_unsubscribe(c->fd, g_iq_feed);
-            g_iq_feed[0]='\0';
-        }
-        ph_reply_ok(c, "unsubscribed iq-source");
-        return;
-    }
-    if(strncmp(line,"swapiq ",7)==0){ int v=atoi(line+7); g_swapiq=(v!=0); ph_reply_okf(c,"swapiq=%d",(int)g_swapiq); return; }
-    if(strncmp(line,"flipq ",6)==0){ int v=atoi(line+6); g_flipq=(v!=0);  ph_reply_okf(c,"flipq=%d",(int)g_flipq);  return; }
-    if(strncmp(line,"neg ",4)==0){   int v=atoi(line+4); g_neg=(v!=0);     ph_reply_okf(c,"neg=%d",(int)g_neg);      return; }
-    if(strncmp(line,"deemph ",7)==0){int v=atoi(line+7); g_deemph=(v!=0);  ph_reply_okf(c,"deemph=%d",(int)g_deemph);return; }
+    if(strncmp(line,"swapiq ",7)==0){ int v=0; if(!parse_int(line+7,&v)){ ph_reply_err(c,"swapiq expects int"); return; } g_swapiq=(v!=0); ph_reply_okf(c,"swapiq=%d",(int)g_swapiq); return; }
+    if(strncmp(line,"flipq ",6)==0){ int v=0; if(!parse_int(line+6,&v)){ ph_reply_err(c,"flipq expects int"); return; } g_flipq=(v!=0);  ph_reply_okf(c,"flipq=%d",(int)g_flipq);  return; }
+    if(strncmp(line,"neg ",4)==0){   int v=0; if(!parse_int(line+4,&v)){ ph_reply_err(c,"neg expects int"); return; } g_neg=(v!=0);     ph_reply_okf(c,"neg=%d",(int)g_neg);      return; }
+    if(strncmp(line,"deemph ",7)==0){int v=0; if(!parse_int(line+7,&v)){ ph_reply_err(c,"deemph expects int"); return; } g_deemph=(v!=0);  ph_reply_okf(c,"deemph=%d",(int)g_deemph);return; }
     if(strncmp(line,"taps1 ",6)==0){
-        int v=atoi(line+6); if(v<31) v=31; if(!(v&1)) v++; g_taps1=v;
+        int v=0; if(!parse_int(line+6,&v)){ ph_reply_err(c,"taps1 expects int"); return; } if(v<31) v=31; if(!(v&1)) v++; g_taps1=v;
         ph_reply_okf(c,"taps1=%d", v); return;
     }
-    if(strncmp(line,"debug ",6)==0){ int v=atoi(line+6); g_debug=v; ph_reply_okf(c,"debug=%d", (int)g_debug); return; }
+    if(strncmp(line,"debug ",6)==0){ int v=0; if(!parse_int(line+6,&v)){ ph_reply_err(c,"debug expects int"); return; } g_debug=v; ph_reply_okf(c,"debug=%d", (int)g_debug); return; }
 
     if(strncmp(line,"gain ",5)==0){
         float g = strtof(line+5,NULL);
@@ -606,7 +618,7 @@ static void on_cmd(ph_ctrl_t *c, const char *line, void *user){
         return;
     }
     if(strncmp(line,"tau ",4)==0){
-        int t = atoi(line+4);
+        int t = 0; if(!parse_int(line+4,&t)){ ph_reply_err(c,"tau expects 50 or 75"); return; }
         if(t!=50 && t!=75) { ph_reply_err(c,"tau must be 50 or 75"); return; }
         g_tau_us = t; ph_reply_okf(c,"tau=%d us", t);
         return;
@@ -744,4 +756,3 @@ void plugin_stop(void){
     free(g_wb.bb);   free(g_wb.dphi); free(g_wb.y1); free(g_wb.y2); free(g_wb.tmp_f);
     memset(&g_wb, 0, sizeof(g_wb));
 }
-

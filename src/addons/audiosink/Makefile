@@ -13,6 +13,7 @@ src/audiosink_ring.c \
 ../../../src/common.c \
 ../../../src/common/ctrlmsg.c \
 ../../../src/common/ph_shm.c \
+../../../src/common/ph_subs.c \
 
 all: $(SO)
 
