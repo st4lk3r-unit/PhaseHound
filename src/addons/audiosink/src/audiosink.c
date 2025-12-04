@@ -148,9 +148,8 @@ static void on_cmd(ph_ctrl_t *c, const char *line, void *u){
 static void *cmd_thread(void *arg){
     (void)arg;
 
-    int fd = -1;
-    for(int i=0;i<50;i++){ fd = uds_connect(g_sock ? g_sock : PH_SOCK_PATH); if(fd>=0) break; struct timespec ts={0,100*1000000L}; nanosleep(&ts,NULL); }
-    if(fd<0) return NULL;
+    int fd = ph_connect_retry(g_sock ? g_sock : PH_SOCK_PATH, 50, 100);
+    if(fd < 0) return NULL;
 
     S.fd = fd;
     /* advertise control feeds */

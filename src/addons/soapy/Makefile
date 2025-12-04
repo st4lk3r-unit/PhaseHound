@@ -11,6 +11,7 @@ SRCS_SO := src/$(NAME).c \
 ../../../src/common.c \
 ../../../src/common/ctrlmsg.c \
 ../../../src/common/ph_shm.c \
+           ../../../src/common/ph_subs.c \
 
 all: $(SO)
 

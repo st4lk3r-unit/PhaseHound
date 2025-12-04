@@ -24,6 +24,7 @@ void ph_create_feed(int fd, const char *feed);
 void ph_subscribe (int fd, const char *feed);
 void ph_unsubscribe(int fd, const char *feed);
 void ph_publish   (int fd, const char *feed, const char *data_json);
+void ph_publish_txt(int fd, const char *feed, const char *txt_utf8);
 void ph_command   (int fd, const char *feed, const char *cmd);
 
 /* Reply helpers (to feed_out) */
@@ -38,3 +39,11 @@ void ph_reply_errf (ph_ctrl_t *c, const char *fmt, ...);
 bool ph_ctrl_dispatch(ph_ctrl_t *c, const char *json, size_t n,
                       void (*on_cmd)(ph_ctrl_t *c, const char *cmdline, void *user),
                       void *user);
+
+/* Helper: connect to broker, init + advertise control-plane context.
+   Returns connected fd on success, or -1 on failure. */
+int ph_connect_ctrl(ph_ctrl_t *c,
+                    const char *addon_name,
+                    const char *sock_path,
+                    int attempts,
+                    int delay_ms);

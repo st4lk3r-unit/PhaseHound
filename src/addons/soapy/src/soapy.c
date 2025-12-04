@@ -29,6 +29,7 @@
 #include "ctrlmsg.h"   // control-plane helpers
 #include "ph_stream.h"
 #include "ph_shm.h"
+#include "ph_subs.h"
 
 #define PLUGIN_NAME "soapy"
 
@@ -42,6 +43,10 @@ static pthread_t   g_rxthr;     // SDR RX thread
 static _Atomic int g_run = 0;
 
 static ph_ctrl_t   g_ctrl;      // control-plane ctx (provides .fd)
+static int soapy_subscribe_cb(void *user, const char *usage, const char *feed);
+static int soapy_unsubscribe_cb(void *user, const char *usage);
+static char g_mon_feed[128] = {0};
+
 
 /* soapy device state */
 typedef struct {
@@ -60,20 +65,8 @@ static phiq_hdr_t *g_hdr  = NULL;
 static size_t     g_map_bytes = 0;
 
 /* ---------- helpers ---------- */
-static void publish_txt(const char *feed, const char *txt){
-    char esc[POC_MAX_JSON/2];
-    size_t bi=0;
-    for(const char *p=txt; *p && bi+2<sizeof esc; ++p){
-        if(*p=='"'||*p=='\\') esc[bi++]='\\';
-        esc[bi++]=*p;
-    }
-    esc[bi]=0;
-    char js[POC_MAX_JSON];
-    snprintf(js,sizeof js,"{\"txt\":\"%s\"}",esc);
-    ph_publish(g_ctrl.fd, feed, js);
-}
-
 static void publish_iq_memfd(void){
+
     if(g_memfd<0 || !g_hdr) return;
     char js[POC_MAX_JSON];
 
@@ -142,6 +135,33 @@ static void iq_ring_close(void){
     g_hdr=NULL; g_memfd=-1; g_map_bytes=0;
 }
 
+
+static int soapy_subscribe_cb(void *user, const char *usage, const char *feed) {
+    ph_ctrl_t *c = (ph_ctrl_t *)user;
+    if (strcmp(usage, "monitor") != 0)
+        return -1;
+
+    if (g_mon_feed[0]) {
+        ph_unsubscribe(c->fd, g_mon_feed);
+        g_mon_feed[0] = '\0';
+    }
+
+    snprintf(g_mon_feed, sizeof g_mon_feed, "%s", feed);
+    ph_subscribe(c->fd, feed);
+    return 0;
+}
+
+static int soapy_unsubscribe_cb(void *user, const char *usage) {
+    ph_ctrl_t *c = (ph_ctrl_t *)user;
+    if (strcmp(usage, "monitor") != 0)
+        return -1;
+
+    if (g_mon_feed[0]) {
+        ph_unsubscribe(c->fd, g_mon_feed);
+        g_mon_feed[0] = '\0';
+    }
+    return 0;
+}
 /* soapy open/config */
 static int soapy_list(char *out, size_t outcap){
     size_t n=0; SoapySDRKwargs *res = SoapySDRDevice_enumerate(NULL,&n);
@@ -256,17 +276,22 @@ static void on_cmd(ph_ctrl_t *c, const char *line, void *user){
     (void)user;
     while(*line==' '||*line=='\t') line++;
 
+    if (ph_handle_subscribe_cmd(c, line, soapy_subscribe_cb, c))
+        return;
+    if (ph_handle_unsubscribe_cmd(c, line, soapy_unsubscribe_cb, c))
+        return;
+
     if(strncmp(line,"help",4)==0){
         ph_reply(c, "{\"ok\":true,"
                       "\"help\":\"help|list|select <idx>|set sr=<Hz> cf=<Hz> [bw=<Hz>]|"
                                "fmt <cf32|cs16>|start|stop|open|status|"
-                               "subscribe <feed>|unsubscribe <feed>\"}");
+                               "subscribe monitor <feed>|unsubscribe monitor\"}");
         return;
     }
 
     if(strncmp(line,"list",4)==0){
         char buf[4096]={0}; soapy_list(buf,sizeof buf);
-        publish_txt("soapy.config.out", buf);
+        ph_publish_txt(g_ctrl.fd, "soapy.config.out", buf);
         ph_reply_ok(c,"listed");
         return;
     }
@@ -329,32 +354,17 @@ static void on_cmd(ph_ctrl_t *c, const char *line, void *user){
         return;
     }
 
-    if(strncmp(line,"subscribe ",10)==0){
-        const char *feed=line+10; while(*feed==' '||*feed=='\t') feed++;
-        if(*feed){ ph_subscribe(c->fd, feed); ph_reply_okf(c,"subscribed %s",feed); }
-        else ph_reply_err(c,"subscribe arg");
-        return;
-    }
-    if(strncmp(line,"unsubscribe ",12)==0){
-        const char *feed=line+12; while(*feed==' '||*feed=='\t') feed++;
-        if(*feed){ ph_unsubscribe(c->fd, feed); ph_reply_okf(c,"unsubscribed %s",feed); }
-        else ph_reply_err(c,"unsubscribe arg");
-        return;
-    }
-
     ph_reply_err(c,"unknown");
 }
 
 /* ---------- worker (single thread: ctrl + bus) ---------- */
 static void *run(void *arg){
     (void)arg;
-    int fd=-1;
-    for(int i=0;i<50;i++){ fd = uds_connect(g_sock?g_sock:PH_SOCK_PATH); if(fd>=0) break; ph_msleep(100); }
-    if(fd<0) return NULL;
-
-    ph_ctrl_init(&g_ctrl, fd, "soapy");     // creates soapy.config.{in,out} and subscribes to .in
-    ph_ctrl_advertise(&g_ctrl);
-    ph_create_feed(fd, FEED_IQ_INFO);       // data feed produced by this addon
+    int fd = ph_connect_ctrl(&g_ctrl, "soapy",
+                             g_sock ? g_sock : PH_SOCK_PATH,
+                             50, 100);
+    if(fd < 0) return NULL;
+     ph_create_feed(fd, FEED_IQ_INFO);       // data feed produced by this addon
 
     /* launch RX thread */
     atomic_store(&g_run, 1);

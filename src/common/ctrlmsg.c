@@ -1,4 +1,5 @@
 #include "ctrlmsg.h"
+#include "common.h"
 #include <stdio.h>
 #include <string.h>
 #include <stdarg.h>
@@ -31,6 +32,16 @@ void ph_publish(int fd, const char *feed, const char *data_json) {
     int n = snprintf(js, sizeof js,
         "{\"type\":\"publish\",\"feed\":\"%s\",\"data\":%s}", feed, data_json);
     if (n > 0) send_frame_json(fd, js, (size_t)n);
+}
+
+void ph_publish_txt(int fd, const char *feed, const char *txt_utf8) {
+    char esc[4096];
+    ph_json_escape_string(txt_utf8 ? txt_utf8 : "", esc, sizeof esc);
+    char js[8192];
+    int n = snprintf(js, sizeof js, "{\"txt\":\"%s\"}", esc);
+    if (n <= 0 || (size_t)n >= sizeof js)
+        return;
+    ph_publish(fd, feed, js);
 }
 
 void ph_command(int fd, const char *feed, const char *cmd) {
@@ -128,4 +139,18 @@ bool ph_ctrl_dispatch(ph_ctrl_t *c, const char *json, size_t n,
         return true;
     }
     return false;
+}
+
+int ph_connect_ctrl(ph_ctrl_t *c,
+                    const char *addon_name,
+                    const char *sock_path,
+                    int attempts,
+                    int delay_ms)
+{
+    if(!c || !addon_name) return -1;
+    int fd = ph_connect_retry(sock_path, attempts, delay_ms);
+    if(fd < 0) return -1;
+    ph_ctrl_init(c, fd, addon_name);
+    ph_ctrl_advertise(c);
+    return fd;
 }

@@ -42,4 +42,14 @@ int json_get_type(const char *json, char *out, size_t outcap);
 // Misc helpers
 void ph_msleep(int ms);
 
+int ph_connect_retry(const char *sock, int attempts, int delay_ms);
+
+/* JSON escaping / publish */
+size_t ph_json_escape_string(const char *in, char *out, size_t cap);
+int ph_publish_text(int fd, const char *feed, const char *txt);
+
+/* logging macro for addons */
+#define ADDON_LOG(name, lvl, fmt, ...) \
+    log_msg((lvl), "[" name "] " fmt, ##__VA_ARGS__)
+
 #endif

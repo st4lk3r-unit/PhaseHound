@@ -381,3 +381,48 @@ void ph_msleep(int ms){
     }
     nanosleep(&ts, NULL);
 }
+
+int ph_connect_retry(const char *sock, int attempts, int delay_ms){
+    if(attempts <= 0) attempts = 1;
+    if(delay_ms < 0) delay_ms = 0;
+    if(!sock) sock = PH_SOCK_PATH;
+    int fd = -1;
+    for(int i = 0; i < attempts; ++i){
+        fd = uds_connect(sock);
+        if(fd >= 0) break;
+        if(delay_ms > 0){
+            ph_msleep(delay_ms);
+        }
+    }
+    return fd;
+}
+
+/* JSON ESCAPE */
+size_t ph_json_escape_string(const char *in, char *out, size_t cap){
+        size_t w = 0;
+    for (size_t i = 0; in[i] && w + 2 < cap; i++) {
+            unsigned char c = (unsigned char)in[i];
+        switch (c) {
+            case '"':  out[w++]='\\'; out[w++]='"';  break;
+        case '\\': out[w++]='\\'; out[w++]='\\'; break;
+        case '\n': out[w++]='\\'; out[w++]='n';  break;
+        default:   out[w++] = c;                break;
+        }
+    }
+    out[w] = 0;
+    return w;
+}
+
+
+int ph_publish_text(int fd, const char *feed, const char *txt){
+        char esc[4096];
+    ph_json_escape_string(txt, esc, sizeof esc);
+
+    char buf[8192];
+    int n = snprintf(buf, sizeof buf,
+                         "{\"type\":\"publish\",\"feed\":\"%s\","
+                     "\"data\":\"%s\",\"encoding\":\"utf8\"}",
+                     feed, esc);
+
+    return send_frame_json(fd, buf, (size_t)n);
+}

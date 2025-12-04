@@ -34,21 +34,6 @@ typedef struct {
 static dummy_sub_t g_subs[4];
 
 /* Tiny JSON escaper (for ph_publish text payloads) */
-static void publish_utf8(int fd, const char *feed, const char *msg) {
-    char esc[POC_MAX_JSON / 2];
-    size_t bi = 0;
-    for (const char *p = msg; *p && bi + 2 < sizeof esc; ++p) {
-        if (*p == '"' || *p == '\\')
-            esc[bi++] = '\\';
-        esc[bi++] = *p;
-    }
-    esc[bi] = '\0';
-
-    char js[POC_MAX_JSON];
-    snprintf(js, sizeof js, "{\"txt\":\"%s\"}", esc);
-    ph_publish(fd, feed, js);
-}
-
 /* --- command handler --- */
 static void on_cmd(ph_ctrl_t *c, const char *line, void *user) {
     (void)user;
@@ -130,7 +115,7 @@ static void on_cmd(ph_ctrl_t *c, const char *line, void *user) {
             arg++;
         if (*arg == 0)
             arg = "bar";
-        publish_utf8(c->fd, "dummy.foo", arg);
+        ph_publish_txt(c->fd, "dummy.foo", arg);
         ph_reply_okf(c, "foo => published \"%s\" to dummy.foo", arg);
         return;
     }
@@ -184,18 +169,13 @@ static void on_cmd(ph_ctrl_t *c, const char *line, void *user) {
 /* --- worker thread --- */
 static void *run(void *arg) {
     (void)arg;
-    int fd = -1;
-    for (int i = 0; i < 50; i++) {
-        fd = uds_connect(g_sock ? g_sock : PH_SOCK_PATH);
-        if (fd >= 0)
-            break;
-        ph_msleep(100);
-    }
+
+    int fd = ph_connect_ctrl(&g_ctrl, "dummy",
+                             g_sock ? g_sock : PH_SOCK_PATH,
+                             50, 100);
     if (fd < 0)
         return NULL;
 
-    ph_ctrl_init(&g_ctrl, fd, "dummy");
-    ph_ctrl_advertise(&g_ctrl);
     ph_create_feed(fd, "dummy.foo");
 
     atomic_store(&g_run, 1);
