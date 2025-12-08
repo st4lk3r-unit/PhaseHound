@@ -39,6 +39,6 @@ Large buffers: SHM fd passed once via UDS (SCM_RIGHTS) + small JSON metadata.
   - `bool plugin_init(const plugin_ctx_t*, plugin_caps_t* out_caps);`
   - `bool plugin_start(void);`
   - `void plugin_stop(void);`
-- The core loads them (autoload on startup or via CLI `load addon <name>`), calls `init` with `PLUGIN_ABI=1` and the broker socket path, then `start` (typically spawns a thread), and later `stop`.
+- The core loads them (autoload on startup or via CLI `load addon <name>`), fills a `plugin_ctx_t` (ABI major/minor plus broker socket path) and passes it to `plugin_init`, then `start` (typically spawns a thread), and later `stop`.
 - See **ADDON_DEVELOPMENT.md** for the full guide.
 

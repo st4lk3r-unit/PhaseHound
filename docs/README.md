@@ -42,7 +42,7 @@ See **CLI.md** for a full tour and **ADDON_DEVELOPMENT.md** to write your first 
 /
   include/          # headers: protocol, plugin ABI, helpers
   src/              # core + common helpers
-    addons/         # sample add‑ons (abracadabra, barbosa, dummy)
+    addons/         # sample add‑ons (soapy, wfmd, audiosink, dummy)
   tools/            # ph-cli
   Makefile          # top-level build (core + cli + addons)
 ```

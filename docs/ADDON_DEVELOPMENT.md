@@ -9,10 +9,17 @@ This document describes how to implement a normalized PhaseHound addon (.so).
 Each addon exports:
 
 ```c
+const char* plugin_name(void);
+
 bool plugin_init(const plugin_ctx_t *ctx, plugin_caps_t *caps);
 bool plugin_start(void);
 void plugin_stop(void);
 ````
+
+`plugin_name()` returns the short logical addon name (e.g. `"wfmd"`).  
+Inside `plugin_init()` you should call `PH_ENSURE_ABI(ctx);` at the top to
+verify `PLUGIN_ABI_MAJOR` / `PLUGIN_ABI_MINOR` before using `ctx->sock_path`.
+
 
 ### 1.1 `plugin_caps_t`
 
@@ -82,11 +89,26 @@ Producers announce rings via a meta message:
 }
 ```
 
-Consumers call:
+Consumers receive a single memfd and map it into their address space,
+then interpret the header as `phiq_hdr_t` (for IQ) or `phau_hdr_t` (for audio)
+from `ph_stream.h`. A minimal IQ consumer looks like:
 
 ```c
-ph_shm_map(fd, memfd, &shm);
+struct stat st;
+if (fstat(memfd, &st) == 0 && st.st_size > (off_t)sizeof(phiq_hdr_t)) {
+    void *base = mmap(NULL, (size_t)st.st_size,
+                      PROT_READ|PROT_WRITE, MAP_SHARED,
+                      memfd, 0);
+    if (base && base != MAP_FAILED) {
+        phiq_hdr_t *hdr = (phiq_hdr_t *)base;
+        /* consume hdr->data using hdr->rpos / hdr->wpos */
+    }
+}
 ```
+
+See `src/addons/wfmd/src/wfmd.c` and `src/addons/audiosink/src/audiosink_ring.c`
+for full producer/consumer patterns.
+
 
 ---
 

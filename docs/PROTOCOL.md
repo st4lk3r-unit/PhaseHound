@@ -16,7 +16,7 @@ Each JSON object must include a `type` field. The core understands these types:
 
 - `"create_feed"`: `{"type":"create_feed","feed":"<name>"}`
 - `"subscribe"`:   `{"type":"subscribe","feed":"<name>"}`
-- `"unsubscribe"`: `{"type":"unsubscribe","feed":"<name>"}`
+- `"unsubscribe"`: accepted but currently ignored by the broker (reserved for future unsubscription support).
 - `"publish"`:     `{"type":"publish","feed":"<name>","data":"<bytes>","encoding":"utf8|base64"}`
 - `"command"`:     free-form command string (used by CLI), routed to `cli-control` feed.
 - `"ping"` / `"pong"`
