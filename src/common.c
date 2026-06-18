@@ -191,6 +191,19 @@ void feedtab_unsub_all_fd(feedtab_t *t, int fd){
     }
     pthread_mutex_unlock(&t->mu);
 }
+
+void feedtab_unsub(feedtab_t *t, const char *name, int fd){
+    pthread_mutex_lock(&t->mu);
+    int idx = feedtab_find_nolock(t, name);
+    if(idx >= 0){
+        intvec_t *iv = &t->v[idx].subs;
+        for(size_t j = 0; j < iv->n; ){
+            if(iv->v[j] == fd) intvec_erase(iv, j);
+            else j++;
+        }
+    }
+    pthread_mutex_unlock(&t->mu);
+}
 void feedtab_list(feedtab_t *t, int fd){
     char buf[POC_MAX_JSON];
     pthread_mutex_lock(&t->mu);
@@ -203,23 +216,33 @@ void feedtab_list(feedtab_t *t, int fd){
 
 // ---- minimal JSON readers (very naive; suitable for PoC) ----
 static int find_key(const char *json, const char *key, const char **val, size_t *vlen){
-    const char *p = strstr(json, key);
+    char qkey[POC_MAX_FEED + 4];
+    int qn = snprintf(qkey, sizeof qkey, "\"%s\"", key);
+    if(qn <= 0) return -1;
+
+    const char *p = strstr(json, qkey);
     if(!p) return -1;
-    p = strchr(p, ':');
-    if(!p) return -1;
-    p++;
-    // skip spaces and optional quotes
-    while(*p==' '||*p=='\t') p++;
-    if(*p=='\"'){
+    p += qn; /* skip past closing quote of the key */
+
+    /* verify ':' follows (with optional whitespace) */
+    while(*p == ' ' || *p == '\t') p++;
+    if(*p != ':') return -1;
+    p++; /* skip ':' */
+
+    /* skip whitespace before value */
+    while(*p == ' ' || *p == '\t') p++;
+
+    if(*p == '\"'){
         p++;
-        const char *q = strchr(p, '\"');
-        if(!q) return -1;
-        *val = p; *vlen = (size_t)(q-p);
+        const char *q = p;
+        while(*q && *q != '\"') q++;
+        if(!*q) return -1;
+        *val = p; *vlen = (size_t)(q - p);
         return 0;
     } else {
         const char *q = p;
-        while(*q && *q!=',' && *q!='}' && *q!='\n') q++;
-        *val = p; *vlen = (size_t)(q-p);
+        while(*q && *q != ',' && *q != '}' && *q != '\n') q++;
+        *val = p; *vlen = (size_t)(q - p);
         return 0;
     }
 }

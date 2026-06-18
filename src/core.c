@@ -11,7 +11,7 @@
 #include <signal.h>
 #include <pthread.h>
 #include <dlfcn.h>
-#include <sys/select.h>
+#include <sys/epoll.h>
 #include <dirent.h>
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -88,16 +88,26 @@ static int g_listen_fd = -1;
 /* ========= Feeds ========= */
 
 static void broadcast_to_subs(const char *feed, const char *json, size_t len, int *fds, size_t nfds){
-    int idx = feedtab_find(&g_feeds, feed);
-    if(idx<0) return;
+    /* Snapshot subscriber list under lock, then send outside lock.
+       Prevents a slow subscriber from blocking all others. */
+    int snap[256]; size_t snap_n = 0;
     pthread_mutex_lock(&g_feeds.mu);
-    for(size_t i=0;i<g_feeds.v[idx].subs.n;i++){
-        int fd = g_feeds.v[idx].subs.v[i];
-        if(((nfds>0)? send_frame_json_with_fds(fd, json, len, fds, nfds) : send_frame_json(fd, json, len))<0){
-            /* drop errors silently; cleanup happens on disconnect */
+    for(size_t i = 0; i < g_feeds.n; i++){
+        if(strcmp(g_feeds.v[i].name, feed) == 0){
+            intvec_t *iv = &g_feeds.v[i].subs;
+            snap_n = iv->n < 256 ? iv->n : 256;
+            for(size_t j = 0; j < snap_n; j++) snap[j] = iv->v[j];
+            break;
         }
     }
     pthread_mutex_unlock(&g_feeds.mu);
+
+    for(size_t i = 0; i < snap_n; i++){
+        if(nfds > 0)
+            send_frame_json_with_fds(snap[i], json, len, fds, nfds);
+        else
+            send_frame_json(snap[i], json, len);
+    }
 }
 
 /* ========= Add-on discovery (autoload) ========= */
@@ -254,7 +264,9 @@ static void handle_msg(int fd, const char *js, int *fds, size_t nfds){
         char name[POC_MAX_FEED]; if(json_get_string(js,"feed",name,sizeof name)==0) feedtab_sub(&g_feeds, name, fd);
 
     } else if(strcmp(type,"unsubscribe")==0){
-        /* left as exercise */
+        char name[POC_MAX_FEED];
+        if(json_get_string(js,"feed",name,sizeof name)==0)
+            feedtab_unsub(&g_feeds, name, fd);
 
     } else if(strcmp(type,"publish")==0){
         char name[POC_MAX_FEED]; if(json_get_string(js,"feed",name,sizeof name)==0) broadcast_to_subs(name, js, strlen(js), fds, nfds);
@@ -321,12 +333,14 @@ static void handle_msg(int fd, const char *js, int *fds, size_t nfds){
 
 static void json_send_kv_list(int fd, const char *type, const char *key, char **items, int n){
     char buf[POC_MAX_JSON]; size_t pos=0;
-    pos += snprintf(buf+pos, sizeof buf - pos, "{\"type\":\"%s\",\"%s\":[", type, key);
+    pos += (size_t)snprintf(buf+pos, sizeof buf - pos, "{\"type\":\"%s\",\"%s\":[", type, key);
     for(int i=0;i<n;i++){
+        char esc[512];
+        ph_json_escape_string(items[i], esc, sizeof esc);
         const char *comma = (i+1<n)?",":"";
-        pos += snprintf(buf+pos, sizeof buf - pos, "\"%s\"%s", items[i], comma);
+        pos += (size_t)snprintf(buf+pos, sizeof buf - pos, "\"%s\"%s", esc, comma);
     }
-    pos += snprintf(buf+pos, sizeof buf - pos, "]}");
+    pos += (size_t)snprintf(buf+pos, sizeof buf - pos, "]}");
     send_frame_json(fd, buf, pos);
 }
 
@@ -347,45 +361,54 @@ int main(void){
     /* autoload addons present */
     autoload_addons();
 
-    /* event loop */
-    int fds[1024]; size_t nfds = 0;
+    /* event loop — epoll-based, no FD_SETSIZE limit */
+    int epfd = epoll_create1(EPOLL_CLOEXEC);
+    if(epfd < 0){ log_msg(LOG_ERROR,"epoll_create1: %s", strerror(errno)); return 1; }
+
+    { struct epoll_event ev = {0}; ev.events = EPOLLIN; ev.data.fd = g_listen_fd;
+      epoll_ctl(epfd, EPOLL_CTL_ADD, g_listen_fd, &ev); }
+
+    struct epoll_event evbuf[64];
     for(;;){
         if(!g_run) break;
-        fd_set r;
-        FD_ZERO(&r);
-        FD_SET(g_listen_fd, &r);
-        int maxfd = g_listen_fd;
-        for(size_t i=0;i<nfds;i++){ FD_SET(fds[i], &r); if(fds[i]>maxfd) maxfd=fds[i]; }
-        struct timeval tv = { .tv_sec=0, .tv_usec=200000 };
-        int rc = select(maxfd+1, &r, NULL, NULL, &tv);
-        if(rc < 0){ if(errno==EINTR) continue; log_msg(LOG_ERROR,"select: %s", strerror(errno)); break; }
+        int nr = epoll_wait(epfd, evbuf, 64, 200);
+        if(nr < 0){ if(errno==EINTR) continue; log_msg(LOG_ERROR,"epoll_wait: %s", strerror(errno)); break; }
 
-        if(FD_ISSET(g_listen_fd, &r)){
-            int cfd = accept(g_listen_fd, NULL, NULL);
-            if(cfd>=0){ set_nonblock(cfd); fds[nfds++] = cfd; log_msg(LOG_INFO,"client connected fd=%d", cfd); }
-        }
+        for(int ei = 0; ei < nr; ei++){
+            int fd = evbuf[ei].data.fd;
 
-        for(size_t i=0;i<nfds;){
-            int fd = fds[i];
-            if(FD_ISSET(fd, &r)){
+            if(fd == g_listen_fd){
+                int cfd = accept(g_listen_fd, NULL, NULL);
+                if(cfd >= 0){
+                    set_nonblock(cfd);
+                    struct epoll_event cev = {0};
+                    cev.events = EPOLLIN;
+                    cev.data.fd = cfd;
+                    if(epoll_ctl(epfd, EPOLL_CTL_ADD, cfd, &cev) < 0){
+                        log_msg(LOG_ERROR,"epoll_ctl add: %s", strerror(errno));
+                        close(cfd);
+                    } else {
+                        log_msg(LOG_INFO,"client connected fd=%d", cfd);
+                    }
+                }
+            } else {
                 char js[POC_MAX_JSON];
                 int ancfds[16];
                 size_t anccnt = sizeof(ancfds)/sizeof(ancfds[0]);
                 int got = recv_frame_json_with_fds(fd, js, sizeof js-1, ancfds, &anccnt, 10);
                 if(got <= 0){
-                    log_msg(LOG_INFO, "client fd=%d disconnected", fd);
+                    log_msg(LOG_INFO,"client fd=%d disconnected", fd);
                     feedtab_unsub_all_fd(&g_feeds, fd);
+                    epoll_ctl(epfd, EPOLL_CTL_DEL, fd, NULL);
                     close(fd);
-                    for(size_t k=i+1;k<nfds;k++) fds[k-1]=fds[k];
-                    nfds--; continue;
                 } else {
                     handle_msg(fd, js, ancfds, anccnt);
-                    for(size_t k=0;k<anccnt;k++){ if(ancfds[k]>=0) close(ancfds[k]); }
+                    for(size_t k = 0; k < anccnt; k++) if(ancfds[k] >= 0) close(ancfds[k]);
                 }
             }
-            i++;
         }
     }
+    close(epfd);
 
     printf ("\t(8D)\n");
     log_msg(LOG_INFO, "core shutting down...");

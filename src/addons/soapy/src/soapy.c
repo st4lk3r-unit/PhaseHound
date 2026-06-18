@@ -254,14 +254,6 @@ static void *rx_thread(void *arg){
         const uint32_t cap = g_hdr->capacity;
 
         uint64_t w = atomic_load(&g_hdr->wpos);
-        uint64_t r = atomic_load(&g_hdr->rpos);
-
-        uint64_t prospective = w + (uint64_t)bytes;
-        if (prospective - r > cap){
-            uint64_t new_r = prospective - cap;
-            atomic_store(&g_hdr->rpos, new_r);
-            r = new_r;
-        }
 
         size_t mod = (size_t)(w % cap);
         size_t first = bytes;
@@ -271,7 +263,8 @@ static void *rx_thread(void *arg){
         if(first < bytes) memcpy(g_hdr->data, tmp + first, bytes - first);
 
         atomic_store(&g_hdr->wpos, w + bytes);
-        uint64_t used = (w + bytes) - r; if(used > cap) used = cap; g_hdr->used = (uint32_t)used;
+        { uint64_t rp = atomic_load(&g_hdr->rpos);
+          uint64_t used = (w + bytes) - rp; if(used > cap) used = cap; g_hdr->used = (uint32_t)used; }
         atomic_fetch_add(&g_hdr->seq, 1);
 
         /* keep meta up to date */
@@ -415,7 +408,7 @@ bool plugin_init(const plugin_ctx_t *ctx, plugin_caps_t *out){
     if(out){
         out->caps_size = sizeof(*out);
         out->name = plugin_name();
-        out->version = "0.4.0";   // fix: proper create_shm_fd(tag, bytes) + strings.h
+        out->version = "0.4.1";
         out->consumes = CONS;
         out->produces = PROD;
         out->feat_bits = PH_FEAT_IQ;

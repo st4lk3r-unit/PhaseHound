@@ -29,10 +29,8 @@ static bool parse_int(const char *s, int *out) {
 #include <stdio.h>
 #include <string.h>
 #include <errno.h>
-#include <stdlib.h>
 #include <time.h>
 #include <stdint.h>
-#include <limits.h>
 
 #include "ph_uds_protocol.h"
 #include "plugin.h"
@@ -156,17 +154,9 @@ static void ring_push_f32(ring_t *r, const float *x, size_t n_frames){
     const size_t bytes = n_frames * fsz;
 
     uint64_t w = atomic_load(&r->hdr->wpos);
-    uint64_t rp= atomic_load(&r->hdr->rpos);
     size_t cap = r->hdr->capacity;
 
-    if(bytes > cap) return; // oversized burst, drop
-
-    // make space if needed (single-producer policy: advance rpos absolutely)
-    if((w - rp) + bytes > cap){
-        uint64_t new_r = (w + bytes) - cap;
-        atomic_store(&r->hdr->rpos, new_r);
-        rp = new_r;
-    }
+    if(bytes > cap) return; /* oversized burst, drop */
 
     size_t wp = (size_t)(w % cap);
     size_t first = bytes;
@@ -307,11 +297,12 @@ static size_t cfirdec_mix_and_push(cfirdec_t *d, nco_t *nco,
 
 /* ---------- work buffers (persistent) ---------- */
 typedef struct {
-    float *bb;     size_t bb_cap;     /* I,Q after channel decim (interleaved) */
-    float *dphi;   size_t dphi_cap;   /* discriminator output @ fs_ch */
-    float *y1;     size_t y1_cap;     /* after a1 */
-    float *y2;     size_t y2_cap;     /* after a2 (final audio to push) */
-    float *tmp_f;  size_t tmp_f_cap;  /* CS16→float conversion scratch */
+    float   *bb;      size_t bb_cap;     /* I,Q after channel decim (interleaved) */
+    float   *dphi;    size_t dphi_cap;   /* discriminator output @ fs_ch */
+    float   *y1;      size_t y1_cap;     /* after a1 */
+    float   *y2;      size_t y2_cap;     /* after a2 (final audio to push) */
+    float   *tmp_f;   size_t tmp_f_cap;  /* CS16→float conversion scratch */
+    uint8_t *iq_raw;  size_t iq_raw_cap; /* raw IQ bytes copied from ring, reused across calls */
 } workbuf_t;
 
 static workbuf_t g_wb = {0};
@@ -487,6 +478,13 @@ static void demod_from_iq_ring(void){
     /* derive available from absolute counters */
     uint64_t r = atomic_load(&h->rpos);
     uint64_t w = atomic_load(&h->wpos);
+
+    /* skip ahead if producer has lapped us */
+    if(w - r > (uint64_t)cap){
+        r = w - (uint64_t)cap;
+        atomic_store(&h->rpos, r);
+    }
+
     uint64_t avail = (w > r) ? (w - r) : 0;
     if(avail < bps) return;
 
@@ -499,8 +497,14 @@ static void demod_from_iq_ring(void){
     size_t mod = (size_t)(r % cap_bytes);
     size_t first = (mod + bytes > cap_bytes) ? (cap_bytes - mod) : bytes;
 
-    uint8_t *tmp = (uint8_t*)malloc(bytes);
-    if(!tmp) return;
+    if(bytes > g_wb.iq_raw_cap){
+        size_t ncap = g_wb.iq_raw_cap ? g_wb.iq_raw_cap : 4096;
+        while(ncap < bytes) ncap <<= 1;
+        uint8_t *p = (uint8_t*)realloc(g_wb.iq_raw, ncap);
+        if(!p){ atomic_store(&h->rpos, r + bytes); return; }
+        g_wb.iq_raw = p; g_wb.iq_raw_cap = ncap;
+    }
+    uint8_t *tmp = g_wb.iq_raw;
 
     memcpy(tmp, h->data + mod, first);
     if(first < bytes) memcpy(tmp + first, h->data, bytes - first);
@@ -518,7 +522,7 @@ static void demod_from_iq_ring(void){
     }else if(h->fmt == PHIQ_FMT_CS16){
         /* convert to float interleaved */
         size_t need = nsamp * 2;
-        if(ensure_cap(&g_wb.tmp_f, &g_wb.tmp_f_cap, need)){ free(tmp); return; }
+        if(ensure_cap(&g_wb.tmp_f, &g_wb.tmp_f_cap, need)){ atomic_store(&h->rpos, r + bytes); return; }
         const int16_t *s = (const int16_t*)tmp;
         const float scale = 1.0f/32768.0f;
         for(size_t i=0;i<nsamp;i++){
@@ -530,7 +534,6 @@ static void demod_from_iq_ring(void){
         // unknown format; drop
     }
 
-    free(tmp);
 }
 
 static void wfmd_publish_memfd(int fd){
@@ -686,16 +689,10 @@ static void *run(void *arg){
         }
 
         /* 2) map incoming IQ ring from soapy (publish + 1 FD) */
-        const char *p_type = strstr(js, "\"type\"");
-        const char *p_feed = strstr(js, "\"feed\"");
-        if(p_type && p_feed){
-            char type[16]={0}, feed[128]={0};
-            const char *t = strchr(p_type, ':'); if(t){ t++; while(*t==' '||*t=='\"'){ if(*t=='\"'){ t++; break; } t++; }
-                size_t i=0; while(*t && *t!='\"' && i+1<sizeof type){ type[i++]=*t++; } type[i]='\0'; }
-            const char *f = strchr(p_feed, ':'); if(f){ f++; while(*f==' '||*f=='\"'){ if(*f=='\"'){ f++; break; } f++; }
-                size_t i=0; while(*f && *f!='\"' && i+1<sizeof feed){ feed[i++]=*f++; } feed[i]='\0'; }
-
-            if(strcmp(type,"publish")==0 && g_iq_feed[0] && strcmp(feed,g_iq_feed)==0){
+        char type[16]={0}, feed[128]={0};
+        if(json_get_type(js, type, sizeof type)==0 &&
+           json_get_string(js, "feed", feed, sizeof feed)==0 &&
+           strcmp(type,"publish")==0 && g_iq_feed[0] && strcmp(feed,g_iq_feed)==0){
                 if(nfds==1 && infd>=0){
                     iq_ring_close(&g_iq);
                     struct stat st;
@@ -708,7 +705,6 @@ static void *run(void *arg){
                         }
                     }
                 }
-            }
         }
         if(infd>=0) close(infd);
     }
@@ -718,7 +714,7 @@ static void *run(void *arg){
     ring_close(&g_ring);
     /* free DSP states and work buffers */
     cfirdec_free(&rf_ch); firdec_free(&a1); firdec_free(&a2);
-    free(g_wb.bb);   free(g_wb.dphi); free(g_wb.y1); free(g_wb.y2); free(g_wb.tmp_f);
+    free(g_wb.bb);   free(g_wb.dphi); free(g_wb.y1); free(g_wb.y2); free(g_wb.tmp_f); free(g_wb.iq_raw);
     memset(&g_wb, 0, sizeof(g_wb));
     return NULL;
 }
@@ -734,7 +730,7 @@ bool plugin_init(const plugin_ctx_t *ctx, plugin_caps_t *out){
     if(out){
         out->caps_size = sizeof(*out);
         out->name = plugin_name();
-        out->version = "0.4.0";
+        out->version = "0.4.1";
         out->consumes = CONS;
         out->produces = PROD;
         out->feat_bits = PH_FEAT_PCM;
@@ -753,6 +749,6 @@ void plugin_stop(void){
     cfirdec_free(&rf_ch); firdec_free(&a1); firdec_free(&a2);
     iq_ring_close(&g_iq);
     ring_close(&g_ring);
-    free(g_wb.bb);   free(g_wb.dphi); free(g_wb.y1); free(g_wb.y2); free(g_wb.tmp_f);
+    free(g_wb.bb);   free(g_wb.dphi); free(g_wb.y1); free(g_wb.y2); free(g_wb.tmp_f); free(g_wb.iq_raw);
     memset(&g_wb, 0, sizeof(g_wb));
 }

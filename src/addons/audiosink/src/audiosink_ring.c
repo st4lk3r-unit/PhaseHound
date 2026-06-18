@@ -53,6 +53,14 @@ size_t au_ring_pop_f32(audiosink_t *s, float *dst, size_t max_frames){
     const size_t frame_bytes = (size_t)h->bytes_per_samp * (size_t)h->channels;
     uint64_t w = atomic_load(&h->wpos);
     uint64_t r = atomic_load(&h->rpos);
+    size_t cap = h->capacity;
+
+    /* skip ahead if producer has lapped consumer */
+    if(w - r > (uint64_t)cap){
+        r = w - (uint64_t)cap;
+        atomic_store(&h->rpos, r);
+    }
+
     if(w <= r) return 0;
 
     size_t avail_bytes  = (size_t)(w - r);
@@ -61,7 +69,6 @@ size_t au_ring_pop_f32(audiosink_t *s, float *dst, size_t max_frames){
     if(avail_frames > max_frames) avail_frames = max_frames;
 
     size_t bytes = avail_frames * frame_bytes;
-    size_t cap   = h->capacity;
     size_t rp    = (size_t)(r % cap);
 
     size_t first = bytes;

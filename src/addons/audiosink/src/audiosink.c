@@ -16,6 +16,7 @@
 
 /* --- addon globals --- */
 static audiosink_t S;
+static ph_ctrl_t   g_ctrl;
 static const char *g_sock = NULL;
 
 static int audiosink_subscribe_cb(void *user, const char *usage, const char *feed) {
@@ -153,6 +154,7 @@ static void *cmd_thread(void *arg){
     if(fd < 0) return NULL;
 
     S.fd = fd;
+    ph_ctrl_init(&g_ctrl, fd, "audiosink");
     /* advertise control feeds */
     ph_create_feed(fd, "audiosink.config.in");
     ph_create_feed(fd, "audiosink.config.out");
@@ -170,8 +172,7 @@ static void *cmd_thread(void *arg){
         if(n <= 0) continue;
 
         /* 1) Let shared dispatcher consume config commands (accepts publish/command) */
-        if(ph_ctrl_dispatch((ph_ctrl_t*)&(ph_ctrl_t){ .fd=fd, .name="audiosink",
-            .feed_in="audiosink.config.in", .feed_out="audiosink.config.out" }, js, (size_t)n, on_cmd, NULL)){
+        if(ph_ctrl_dispatch(&g_ctrl, js, (size_t)n, on_cmd, NULL)){
             if(infd>=0) close(infd);
             continue;
         }
@@ -214,7 +215,7 @@ bool plugin_init(const plugin_ctx_t *ctx, plugin_caps_t *out){
 
     if(out){
         out->caps_size = sizeof(*out);
-        out->name=plugin_name(); out->version="0.4.0";
+        out->name=plugin_name(); out->version="0.4.1";
         out->consumes=CONS;    out->produces=PROD;
         out->feat_bits = PH_FEAT_PCM;
     }

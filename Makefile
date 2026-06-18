@@ -20,7 +20,7 @@ CFLAGS  += -DPH_GIT_SHA=\"$(GIT_SHA)\"
 
 .PHONY: all clean addons install
 
-all: $(CORE_BIN) $(CLI_BIN) addons addons
+all: $(CORE_BIN) $(CLI_BIN) addons
 
 $(CORE_BIN): $(CORE_OBJS)
 	$(CC) $(CFLAGS) $^ -o $@ $(LDFLAGS)
