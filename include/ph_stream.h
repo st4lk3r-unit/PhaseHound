@@ -8,7 +8,7 @@
 //  - soapy (IQ producer)
 //  - wfmd (IQ consumer + audio producer)
 //  - audiosink (audio consumer)
-//  - future filesink/filesource, ADS-B, TPMS, …
+//  - filesink/filesource, future ADS-B, TPMS, …
 
 #include <stdatomic.h>
 #include <stdint.h>
@@ -83,6 +83,9 @@ typedef struct {
 #endif
 #ifndef PHAU_FMT_F32
 #define PHAU_FMT_F32 1u
+#endif
+#ifndef PHAU_FMT_S16
+#define PHAU_FMT_S16 2u
 #endif
 
 typedef struct {

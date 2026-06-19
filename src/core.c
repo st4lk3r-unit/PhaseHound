@@ -78,7 +78,7 @@ static void plugtab_remove(plugtab_t *t, size_t idx){
 
 /* ========= Global state ========= */
 
-static volatile int g_run = 1;
+static volatile sig_atomic_t g_run = 1;
 static void on_sigint(int s){ (void)s; g_run = 0; }
 
 static feedtab_t g_feeds;
@@ -149,6 +149,33 @@ static int scan_addon_paths(char paths[][512], int maxn){
         closedir(d);
     }
     return n;
+}
+
+
+static int resolve_addon_arg(const char *arg, char out[512]){
+    if(!arg || !out) return -1;
+    out[0] = '\0';
+
+    if(strstr(arg, ".so") && access(arg, R_OK)==0){
+        return path_copy(out, 512, arg);
+    }
+
+    char want1[512], want2[512];
+    int n1 = snprintf(want1, sizeof want1, "ph-lib%s.so", arg);
+    int n2 = snprintf(want2, sizeof want2, "%s.so", arg);
+    if(n1 < 0 || n2 < 0 || (size_t)n1 >= sizeof want1 || (size_t)n2 >= sizeof want2)
+        return -1;
+
+    char paths[128][512];
+    int n = scan_addon_paths(paths, 128);
+    for(int i=0;i<n;i++){
+        const char *base = strrchr(paths[i], '/');
+        base = base ? base + 1 : paths[i];
+        if(strcmp(base, want1)==0 || strcmp(base, want2)==0 || strcmp(base, arg)==0){
+            return path_copy(out, 512, paths[i]);
+        }
+    }
+    return -1;
 }
 
 /* ========= Loader / Unloader (centralized) ========= */
@@ -269,7 +296,21 @@ static void handle_msg(int fd, const char *js, int *fds, size_t nfds){
             feedtab_unsub(&g_feeds, name, fd);
 
     } else if(strcmp(type,"publish")==0){
-        char name[POC_MAX_FEED]; if(json_get_string(js,"feed",name,sizeof name)==0) broadcast_to_subs(name, js, strlen(js), fds, nfds);
+        char name[POC_MAX_FEED];
+        if(json_get_string(js,"feed",name,sizeof name)==0){
+            broadcast_to_subs(name, js, strlen(js), fds, nfds);
+            /* CLI publishers can request a broker-level dispatch acknowledgement.
+             * It confirms ordered delivery into subscriber sockets, not addon success. */
+            char ack_req[16];
+            if(json_get_string(js,"ack",ack_req,sizeof ack_req)==0 &&
+               (!strcmp(ack_req,"true") || !strcmp(ack_req,"1"))){
+                char feed_esc[POC_MAX_FEED * 2], ack[POC_MAX_JSON];
+                ph_json_escape_string(name, feed_esc, sizeof feed_esc);
+                int n = snprintf(ack,sizeof ack,
+                    "{\"type\":\"ack\",\"op\":\"publish\",\"feed\":\"%s\"}", feed_esc);
+                if(n > 0 && (size_t)n < sizeof ack) (void)send_frame_json(fd,ack,(size_t)n);
+            }
+        }
 
     } else if(strcmp(type,"command")==0){
         char feed[POC_MAX_FEED]; if(json_get_string(js,"feed",feed,sizeof feed)<0) return;
@@ -298,23 +339,39 @@ static void handle_msg(int fd, const char *js, int *fds, size_t nfds){
             json_send_kv_list(fd, "available-addons", "paths", items, n);
 
         } else if(strncmp(cmd,"load ",5)==0){
-            char arg[256]; strncpy(arg, cmd+5, sizeof arg-1); arg[sizeof arg-1]='\0';
-            /* Require explicit .so path */
-            if(access(arg, R_OK)!=0 || !strstr(arg, ".so")){
-                log_msg(LOG_ERROR, "load: provide a readable .so file path");
+            char arg[256]; snprintf(arg,sizeof arg,"%s",cmd+5);
+            char resolved[512], arg_esc[512];
+            ph_json_escape_string(arg,arg_esc,sizeof arg_esc);
+            if(resolve_addon_arg(arg, resolved)!=0){
+                log_msg(LOG_ERROR, "load: addon '%s' not found; use available-addons or pass a readable .so path", arg);
+                char buf[POC_MAX_JSON];
+                int len = snprintf(buf, sizeof buf, "{\"type\":\"error\",\"msg\":\"addon not found: %s\"}", arg_esc);
+                if(len > 0 && (size_t)len < sizeof buf) send_frame_json(fd, buf, (size_t)len);
             } else {
-                int rc = load_plugin_from_path(arg);
-                if(rc==0){
-                    char buf[POC_MAX_JSON];
-                    int len = snprintf(buf, sizeof buf, "{\"type\":\"info\",\"msg\":\"loaded %s\"}", arg);
-                    send_frame_json(fd, buf, (size_t)len);
-                }
+                int rc = load_plugin_from_path(resolved);
+                char buf[POC_MAX_JSON], resolved_esc[1024];
+                ph_json_escape_string(resolved,resolved_esc,sizeof resolved_esc);
+                int len;
+                if(rc==0 || rc==1)
+                    len = snprintf(buf, sizeof buf, "{\"type\":\"info\",\"msg\":\"loaded %s\"}", resolved_esc);
+                else
+                    len = snprintf(buf, sizeof buf, "{\"type\":\"error\",\"msg\":\"failed to load %s (rc=%d)\"}", resolved_esc, rc);
+                if(len > 0 && (size_t)len < sizeof buf) send_frame_json(fd, buf, (size_t)len);
             }
 
         } else if(strncmp(cmd,"unload ",7)==0){
-            char name[128]; strncpy(name, cmd+7, sizeof name-1); name[sizeof name-1]='\0';
+            char name[256]; snprintf(name,sizeof name,"%s",cmd+7);
             int rc = unload_plugin_by_name(name);
-            if(rc<0) log_msg(LOG_WARN, "unload: %s not found", name);
+            char buf[POC_MAX_JSON], name_esc[256];
+            ph_json_escape_string(name,name_esc,sizeof name_esc);
+            if(rc<0){
+                log_msg(LOG_WARN, "unload: %s not found", name);
+                int len = snprintf(buf, sizeof buf, "{\"type\":\"error\",\"msg\":\"addon not loaded: %s\"}", name_esc);
+                if(len > 0 && (size_t)len < sizeof buf) send_frame_json(fd, buf, (size_t)len);
+            } else {
+                int len = snprintf(buf, sizeof buf, "{\"type\":\"info\",\"msg\":\"unloaded %s\"}", name_esc);
+                if(len > 0 && (size_t)len < sizeof buf) send_frame_json(fd, buf, (size_t)len);
+            }
 
         } else if(strcmp(cmd,"exit")==0){
             g_run = 0;
@@ -348,6 +405,7 @@ static void json_send_kv_list(int fd, const char *type, const char *key, char **
 
 int main(void){
     signal(SIGINT, on_sigint);
+    signal(SIGTERM, on_sigint);
     feedtab_init(&g_feeds);
     plugtab_init(&g_plugins);
 

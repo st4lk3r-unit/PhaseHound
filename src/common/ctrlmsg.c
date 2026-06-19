@@ -6,32 +6,38 @@
 
 /* ---- low-level emitters ---- */
 
+static int escape_feed(const char *feed, char *out, size_t cap){
+    if(!feed || !out || cap == 0) return -1;
+    ph_json_escape_string(feed,out,cap);
+    return 0;
+}
+
 void ph_create_feed(int fd, const char *feed) {
-    char js[256];
+    char fesc[192], js[256]; escape_feed(feed,fesc,sizeof fesc);
     int n = snprintf(js, sizeof js,
-        "{\"type\":\"create_feed\",\"feed\":\"%s\"}", feed);
-    if (n > 0) send_frame_json(fd, js, (size_t)n);
+        "{\"type\":\"create_feed\",\"feed\":\"%s\"}", fesc);
+    if (n > 0 && (size_t)n < sizeof js) send_frame_json(fd, js, (size_t)n);
 }
 
 void ph_subscribe(int fd, const char *feed) {
-    char js[256];
+    char fesc[192], js[256]; escape_feed(feed,fesc,sizeof fesc);
     int n = snprintf(js, sizeof js,
-        "{\"type\":\"subscribe\",\"feed\":\"%s\"}", feed);
-    if (n > 0) send_frame_json(fd, js, (size_t)n);
+        "{\"type\":\"subscribe\",\"feed\":\"%s\"}", fesc);
+    if (n > 0 && (size_t)n < sizeof js) send_frame_json(fd, js, (size_t)n);
 }
 
 void ph_unsubscribe(int fd, const char *feed) {
-    char js[256];
+    char fesc[192], js[256]; escape_feed(feed,fesc,sizeof fesc);
     int n = snprintf(js, sizeof js,
-        "{\"type\":\"unsubscribe\",\"feed\":\"%s\"}", feed);
-    if (n > 0) send_frame_json(fd, js, (size_t)n);
+        "{\"type\":\"unsubscribe\",\"feed\":\"%s\"}", fesc);
+    if (n > 0 && (size_t)n < sizeof js) send_frame_json(fd, js, (size_t)n);
 }
 
 void ph_publish(int fd, const char *feed, const char *data_json) {
-    char js[1024];
+    char fesc[192], js[1024]; escape_feed(feed,fesc,sizeof fesc);
     int n = snprintf(js, sizeof js,
-        "{\"type\":\"publish\",\"feed\":\"%s\",\"data\":%s}", feed, data_json);
-    if (n > 0) send_frame_json(fd, js, (size_t)n);
+        "{\"type\":\"publish\",\"feed\":\"%s\",\"data\":%s}", fesc, data_json);
+    if (n > 0 && (size_t)n < sizeof js) send_frame_json(fd, js, (size_t)n);
 }
 
 void ph_publish_txt(int fd, const char *feed, const char *txt_utf8) {
@@ -39,16 +45,17 @@ void ph_publish_txt(int fd, const char *feed, const char *txt_utf8) {
     ph_json_escape_string(txt_utf8 ? txt_utf8 : "", esc, sizeof esc);
     char js[8192];
     int n = snprintf(js, sizeof js, "{\"txt\":\"%s\"}", esc);
-    if (n <= 0 || (size_t)n >= sizeof js)
-        return;
+    if (n <= 0 || (size_t)n >= sizeof js) return;
     ph_publish(fd, feed, js);
 }
 
 void ph_command(int fd, const char *feed, const char *cmd) {
-    char js[768];
+    char fesc[192], cesc[1024], js[1400];
+    escape_feed(feed,fesc,sizeof fesc);
+    ph_json_escape_string(cmd ? cmd : "",cesc,sizeof cesc);
     int n = snprintf(js, sizeof js,
-        "{\"type\":\"command\",\"feed\":\"%s\",\"data\":\"%s\"}", feed, cmd);
-    if (n > 0) send_frame_json(fd, js, (size_t)n);
+        "{\"type\":\"command\",\"feed\":\"%s\",\"data\":\"%s\"}", fesc, cesc);
+    if (n > 0 && (size_t)n < sizeof js) send_frame_json(fd, js, (size_t)n);
 }
 
 /* ---- control context ---- */
@@ -113,47 +120,6 @@ void ph_reply_errf(ph_ctrl_t *c, const char *fmt, ...) {
    Expects frames shaped like:
    {"type":"command","feed":"<name>.config.in","data":"<cmdline>"}
 */
-static const char *json_get(const char *js, const char *key, char *out, size_t outsz)
-{
-    /* Super-lightweight extractor: ONLY for our own flat control frames.
-       Not a general JSON parser. Returns NULL on any structural weirdness
-       or potential overflow. */
-    if (!js || !key || !out || outsz == 0)
-        return NULL;
-
-    const char *p = strstr(js, key);
-    if (!p)
-        return NULL;
-
-    p = strchr(p, ':');
-    if (!p)
-        return NULL;
-    p++;
-
-    /* Skip whitespace */
-    while (*p == ' ' || *p == '	')
-        p++;
-
-    /* Optional opening quote */
-    if (*p == '"')
-        p++;
-
-    size_t i = 0;
-    while (*p && *p != '"' && (unsigned char)*p != 10 && (unsigned char)*p != 13 && i + 1 < outsz) {
-        out[i++] = *p++;
-    }
-
-    if (!*p) {
-        /* Unterminated or malformed; don't trust output */
-        if (outsz > 0)
-            out[0] = 0;
-        return NULL;
-    }
-
-    out[i] = 0;
-    return out;
-}
-
 bool ph_ctrl_dispatch(ph_ctrl_t *c, const char *json, size_t n,
                       void (*on_cmd)(ph_ctrl_t *c, const char *cmdline, void *user),
                       void *user)
@@ -161,16 +127,15 @@ bool ph_ctrl_dispatch(ph_ctrl_t *c, const char *json, size_t n,
     (void)n;
     char type[32]={0}, feed[128]={0}, data[1024]={0};
 
-    if (!json_get(json, "\"type\"", type, sizeof type)) return false;
-    if (!json_get(json, "\"feed\"", feed, sizeof feed)) return false;
+    if (json_get_string(json, "type", type, sizeof type) < 0) return false;
+    if (json_get_string(json, "feed", feed, sizeof feed) < 0) return false;
     if (strcmp(feed, c->feed_in)!=0) return false;
 
     /* Accept either:
        - {"type":"command","feed":"...config.in","data":"<cmdline>"}
-       - {"type":"publish","feed":"...config.in","data":"<cmdline>"}  (from: ph-cli pub ...)
-    */
+       - {"type":"publish","feed":"...config.in","data":"<cmdline>"} */
     if (strcmp(type,"command")==0 || strcmp(type,"publish")==0) {
-        if (!json_get(json, "\"data\"", data, sizeof data)) data[0]='\0';
+        if (json_get_string(json, "data", data, sizeof data) < 0) data[0]='\0';
         if (on_cmd) on_cmd(c, data, user);
         return true;
     }

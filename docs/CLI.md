@@ -1,124 +1,98 @@
 # PhaseHound CLI
 
-The PhaseHound command-line tool `ph-cli` is a thin client for the Unix-domain-socket broker:
+`ph-cli` is a small client for the local broker. It sends management commands, publishes addon control text, and monitors one or more feeds.
 
-- sends commands (`cmd` / `pub`),
-- subscribes to feeds (`sub`),
-- prints raw JSON and SHM metadata.
-
-The CLI itself does not interpret SHM contents; it only frames JSON and forwards any attached file descriptors.
-
-## 1. Top-level usage
+## Commands
 
 ```bash
-ph-cli help
-ph-cli cmd "<text>"
-ph-cli pub <feed> "<data>"
-ph-cli sub <feed> [feed2 ...]
-ph-cli list feeds | list addons | available-addons
-ph-cli load addon <name|/path/to/lib.so>
-ph-cli unload addon <name>
+./ph-cli help
+./ph-cli cmd "<broker command>"
+./ph-cli pub <feed> "<text>"
+./ph-cli sub <feed> [feed2 ...]
+./ph-cli list feeds
+./ph-cli list addons
+./ph-cli available-addons
+./ph-cli load addon <name|/path/to/ph-libname.so>
+./ph-cli unload addon <name>
 ```
 
-- `help` – ask the broker to print its help on the special `cli-control` feed.
-- `cmd` – send a raw command string to `cli-control` (broker management).
-- `pub` – publish a UTF‑8 text payload to an arbitrary feed (usually `<name>.config.in`).
-- `sub` – subscribe to one or more feeds and print everything routed there.
-- `list` / `available-addons` – introspect feeds and discover loadable addons.
-- `load addon` / `unload addon` – dynamically load or unload shared‑object addons.
+`list`, `load`, and `unload` wait for direct broker responses. `pub` requests and waits for a broker dispatch acknowledgement. This makes sequential CLI publications ordered at the subscriber socket, but it does not report whether an addon accepted the command.
 
-## 2. Publishing to addon config feeds
+Addon acknowledgements and validation errors are published on `<addon>.config.out`, so inspect them with another CLI process:
 
-Addon configuration flows over `<name>.config.in` feeds. For example:
+```bash
+./ph-cli sub soapy.config.out wfmd.config.out filesink.config.out
+```
+
+## Addon control
 
 ```bash
 ./ph-cli pub soapy.config.in "help"
-./ph-cli pub wfmd.config.in "help"
-./ph-cli pub audiosink.config.in "help"
+./ph-cli pub wfmd.config.in "status"
+./ph-cli pub filesource.config.in "start"
 ```
 
-See the individual addon READMEs for supported commands.
+The CLI JSON-escapes feed names and text payloads before sending them.
 
-## 3. Subscribing to feeds
+## Usage-tagged routing
 
-### 3.1 Inspect config feeds
-
-```bash
-./ph-cli sub soapy.config.out
-./ph-cli sub wfmd.config.out
-./ph-cli sub audiosink.config.out
-```
-
-This prints all JSON messages in live mode.
-
-### 3.2 Inspect SHM meta feeds
-
-```bash
-./ph-cli sub wfmd.audio-info
-```
-
-- `wfmd.audio-info` carries audio ring metadata and `shm_map` descriptors.
-- `soapy.IQ-info` carries IQ ring metadata in the same fashion.
-
-## 4. Usage-tagged routing
-
-Addons use a normalized control pattern:
+Consumers use this normalized pattern:
 
 ```text
 subscribe <usage> <feed>
 unsubscribe <usage>
 ```
 
-The `usage` is a logical label (e.g. `iq-source`, `pcm-source`) that the addon interprets internally.
+Common usage labels:
 
-### 4.1 WFMD (IQ demodulator)
+```text
+wfmd:      iq-source
+filesink:  iq-source, pcm-source (audio-source alias)
+audiosink: pcm-source (pcm/audio-source aliases)
+soapy:     monitor
+```
+
+Examples:
 
 ```bash
 ./ph-cli pub wfmd.config.in "subscribe iq-source soapy.IQ-info"
-```
-
-WFMD will:
-
-- unsubscribe any previous IQ source,
-- subscribe to `soapy.IQ-info`,
-- start watching for `shm_map` descriptors on that feed.
-
-### 4.2 audiosink (audio sink)
-
-```bash
+./ph-cli pub filesink.config.in "subscribe pcm-source wfmd.audio-info"
 ./ph-cli pub audiosink.config.in "subscribe pcm-source wfmd.audio-info"
 ```
 
-`audiosink` will:
+## Live RF graph
 
-- subscribe to `wfmd.audio-info`,
-- map the advertised audio ring from the attached memfd,
-- start playing PCM frames via ALSA when `start` is issued.
-
-## 5. Full RF pipeline example
-
-Putting it together:
+Subscribe consumers before asking producers to publish ring descriptors:
 
 ```bash
-# Load addons
-./ph-cli load addon soapy
-./ph-cli load addon wfmd
-./ph-cli load addon audiosink
+./ph-cli pub soapy.config.in "select 0"
+./ph-cli pub soapy.config.in "set sr=2400000 cf=100.0e6 bw=1.5e6"
 
-# Wire the graph
 ./ph-cli pub wfmd.config.in "subscribe iq-source soapy.IQ-info"
-./ph-cli pub soapy.config.in "open"
+./ph-cli pub audiosink.config.in "subscribe pcm-source wfmd.audio-info"
+
 ./ph-cli pub wfmd.config.in "open"
-./ph-cli pub audiosink.config.in "subscribe pcm-source wfmd.audio-info"
-
-# Start processing
-./ph-cli pub wfmd.config.in "gain 0.5"
+./ph-cli pub soapy.config.in "start"
 ./ph-cli pub wfmd.config.in "start"
 ./ph-cli pub audiosink.config.in "start"
 ```
 
-## 6. Notes
+Use `open` to republish an existing descriptor to a late subscriber:
 
-- The CLI does not persist subscriptions between runs.
-- Feeds are plain strings; there are no reserved magic names beyond conventions like `*.config.in/out`.
-- Wiring is always explicit; there is no auto-connect logic in the core or CLI.
+```bash
+./ph-cli pub soapy.config.in "open"
+./ph-cli pub wfmd.config.in "open"
+./ph-cli pub filesource.config.in "open"
+```
+
+## File graph
+
+```bash
+./ph-cli pub filesource.config.in "path /tmp/capture.phcap"
+./ph-cli pub filesource.config.in "format phcap"
+./ph-cli pub wfmd.config.in "subscribe iq-source filesource.IQ-info"
+./ph-cli pub filesource.config.in "start"
+./ph-cli pub wfmd.config.in "start"
+```
+
+See `FILE_IO.md` and each addon README for the complete command set.

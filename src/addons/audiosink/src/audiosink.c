@@ -59,17 +59,19 @@ static int audiosink_unsubscribe_cb(void *user, const char *usage) {
 /* ---- playback thread ---- */
 static void *play_thread(void *arg){
     (void)arg;
-    float framebuf[2048];
+    float framebuf[1024];
 
     while(atomic_load(&S.play_run)){
         if(!S.hdr || !S.pcm){ ph_msleep(5); continue; }
 
-        size_t nframes = au_ring_pop_f32(&S, framebuf, sizeof(framebuf)/sizeof(framebuf[0]));
-        if(nframes == 0){ ph_msleep(2); continue; }
+        unsigned ch = S.hdr->channels ? S.hdr->channels : 1u;
+        size_t max_frames = (sizeof(framebuf)/sizeof(framebuf[0])) / ch;
+        size_t nframes = au_ring_pop_f32(&S, framebuf, max_frames);
+        if(nframes == 0){ S.underrun_events++; ph_msleep(1); continue; }
 
         snd_pcm_sframes_t wrote = snd_pcm_writei(S.pcm, framebuf, nframes);
         if(wrote < 0){
-            if(wrote == -EPIPE){ snd_pcm_prepare(S.pcm); continue; }
+            if(wrote == -EPIPE){ S.xrun_events++; snd_pcm_prepare(S.pcm); continue; }
             if(wrote == -ESTRPIPE){
                 while((wrote = snd_pcm_resume(S.pcm)) == -EAGAIN) ph_msleep(1);
                 if(wrote < 0) snd_pcm_prepare(S.pcm);
@@ -137,9 +139,21 @@ static void on_cmd(ph_ctrl_t *c, const char *line, void *u){
     }
     if(strcmp(line,"status")==0){
         char js[256];
+        uint64_t w = S.hdr ? atomic_load(&S.hdr->wpos) : 0;
+        uint64_t lag_bytes = (S.hdr && w >= S.consumer.rpos) ? (w - S.consumer.rpos) : 0;
+        double lag_ms = 0.0;
+        if (S.hdr && S.hdr->sample_rate > 0.0 && S.hdr->bytes_per_samp && S.hdr->channels) {
+            double frame_bytes = (double)S.hdr->bytes_per_samp * (double)S.hdr->channels;
+            lag_ms = 1000.0 * ((double)lag_bytes / frame_bytes) / S.hdr->sample_rate;
+        }
         snprintf(js,sizeof js,
-            "{\"ok\":true,\"pcm\":%s,\"feed\":\"%s\"}",
-            S.pcm?"true":"false", S.current_feed[0]?S.current_feed:"");
+            "{\"ok\":true,\"pcm\":%s,\"feed\":\"%s\",\"lag_ms\":%.3f,"
+            "\"lost_bytes\":%llu,\"overrun_events\":%llu,\"underruns\":%llu,\"xruns\":%llu}",
+            S.pcm?"true":"false", S.current_feed[0]?S.current_feed:"", lag_ms,
+            (unsigned long long)S.consumer.lost_bytes,
+            (unsigned long long)S.consumer.overrun_events,
+            (unsigned long long)S.underrun_events,
+            (unsigned long long)S.xrun_events);
         ph_reply(c, js);
         return;
     }

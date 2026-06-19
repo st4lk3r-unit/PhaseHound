@@ -40,8 +40,10 @@ struct shm_hdr {
 ```
 
 - **seq**: monotonic counter incremented on each buffer update
-- **used/capacity**: region size information
-- Optionally extend with ring indices (`head/tail`), timestamps, sample format, etc.
+- **wpos** on stream rings: absolute producer byte cursor
+- **used/capacity**: producer-owned region size/fill hint
+- **rpos** on v0 stream rings is legacy compatibility only; real consumers keep a local cursor
+- **reserved[64]** on IQ/audio v0 rings may contain `ph_ring_meta_v0_t` for counters and latest timestamp
 
 Consumers subscribe to an event feed (e.g., `iq.rx0.events`) for lightweight notifications like `{"subtype":"shm_ready","seq":42,"bytes":1048576}`.
 
@@ -55,3 +57,19 @@ Consumers subscribe to an event feed (e.g., `iq.rx0.events`) for lightweight not
 
 - Avoid re‑encoding or base64 for bulk paths
 - Keep JSON envelopes small and infrequent (control only)
+
+
+## Multi-consumer rings
+
+Do not use a shared read cursor for real fan-out. Each consumer should keep a local `ph_ring_consumer_t` and read with the helpers in `ph_ring.h`. This prevents one decoder from advancing another decoder's stream position.
+
+Overwrite handling is consumer-side:
+
+```c
+if (wpos - local_rpos > capacity) {
+    lost = (wpos - local_rpos) - capacity;
+    local_rpos = wpos - capacity;
+}
+```
+
+The producer may overwrite old samples. Consumers report their own loss/lag in status.

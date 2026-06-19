@@ -1,10 +1,10 @@
 #include "audiosink.h"
-#include <alloca.h>  
+#include <alloca.h>
 #include <stdio.h>
 
 void au_pcm_close(audiosink_t *s){
     if(s->pcm){
-        snd_pcm_drain(s->pcm);
+        snd_pcm_drop(s->pcm);
         snd_pcm_close(s->pcm);
         s->pcm = NULL;
     }
