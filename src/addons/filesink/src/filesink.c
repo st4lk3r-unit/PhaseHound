@@ -27,7 +27,7 @@
 
 #define PLUGIN_NAME "filesink"
 
-typedef enum { FMT_RAW = 0, FMT_PHCAP = 1, FMT_WAV = 2 } file_fmt_t;
+typedef enum { FMT_RAW = 0, FMT_PHCAP = 1, FMT_WAV = 2, FMT_HEX = 3 } file_fmt_t;
 typedef enum { META_NONE = 0, META_JSONL = 1 } meta_mode_t;
 
 typedef struct {
@@ -219,8 +219,13 @@ static int target_write_wav_header_locked(sink_target_t *t){
 static void target_finalize_wav_locked(sink_target_t *t){
     if(!t || !t->out || !t->wav_header_written || target_fmt(t) != FMT_WAV) return;
     uint64_t data_bytes = atomic_load(&t->bytes_written);
-    uint32_t data32     = data_bytes > 0xFFFFFFFFu ? 0xFFFFFFFFu : (uint32_t)data_bytes;
-    uint32_t riff32     = data32 > 0xFFFFFFFFu - 36u ? 0xFFFFFFFFu : 36u + data32;
+    if(data_bytes > 0xFFFFFFFFu - 36u)
+        fprintf(stderr, "[filesink] WARNING: WAV file exceeded 4 GiB (%llu bytes);"
+                " RIFF size fields will be capped — output may not be readable by all players."
+                " Consider switching to raw or phcap format for long recordings.\n",
+                (unsigned long long)data_bytes);
+    uint32_t data32 = data_bytes > 0xFFFFFFFFu ? 0xFFFFFFFFu : (uint32_t)data_bytes;
+    uint32_t riff32 = data32 > 0xFFFFFFFFu - 36u ? 0xFFFFFFFFu : 36u + data32;
     fflush(t->out);
     if(fseek(t->out, 4,  SEEK_SET) == 0) (void)fwrite(&riff32, 4, 1, t->out);
     if(fseek(t->out, 40, SEEK_SET) == 0) (void)fwrite(&data32, 4, 1, t->out);
@@ -328,6 +333,23 @@ static size_t target_consume_locked(sink_target_t *t, uint8_t *buf, size_t want)
                 if(fwrite(buf, sizeof(int16_t), ns, t->out) != ns) atomic_fetch_add(&t->write_errors,1);
                 atomic_fetch_add(&t->bytes_written, ns * sizeof(int16_t));
             }
+        } else if(target_fmt(t) == FMT_HEX) {
+            /* Write as lowercase hex pairs, 32 bytes per line */
+            static const char hx[] = "0123456789abcdef";
+            char hex_line[32*3];
+            size_t hpos=0, col=0;
+            for(size_t b=0;b<got;b++){
+                if(col>0) hex_line[hpos++]=' ';
+                hex_line[hpos++]=hx[(buf[b]>>4)&0xF];
+                hex_line[hpos++]=hx[buf[b]&0xF];
+                col++;
+                if(col==32 || b==got-1){
+                    hex_line[hpos++]='\n';
+                    if(fwrite(hex_line,1,hpos,t->out)!=hpos) atomic_fetch_add(&t->write_errors,1);
+                    atomic_fetch_add(&t->bytes_written,hpos);
+                    hpos=0; col=0;
+                }
+            }
         } else {
             /* FMT_RAW, or WAV applied to IQ target (fallback: write raw) */
             if(fwrite(buf,1,got,t->out) != got) atomic_fetch_add(&t->write_errors,1);
@@ -418,12 +440,15 @@ static void status_target_json(char *dst, size_t cap, const char *name, sink_tar
     uint64_t lag=0,w=0;
     if(t->iq){ w=atomic_load(&t->iq->wpos); if(w>=t->consumer.rpos) lag=w-t->consumer.rpos; }
     else if(t->au){ w=atomic_load(&t->au->wpos); if(w>=t->consumer.rpos) lag=w-t->consumer.rpos; }
+    const char *fmtstr = target_fmt(t)==FMT_PHCAP?"phcap":
+                         (target_fmt(t)==FMT_WAV?"wav":
+                         (target_fmt(t)==FMT_HEX?"hex":"raw"));
     snprintf(dst,cap,
         "\"%s\":{\"path\":\"%s\",\"feed\":\"%s\",\"mapped\":%d,\"format\":\"%s\",\"encoding\":\"%s\"," \
         "\"wpos\":%llu,\"rpos\":%llu,\"lag_bytes\":%llu,\"bytes_written\":%llu," \
         "\"blocks\":%llu,\"lost_bytes\":%llu,\"overrun_events\":%llu,\"write_errors\":%llu}",
         name, pesc, fesc, target_has_ring(t),
-        target_fmt(t)==FMT_PHCAP?"phcap":(target_fmt(t)==FMT_WAV?"wav":"raw"), enc_str(t->encoding),
+        fmtstr, enc_str(t->encoding),
         (unsigned long long)w, (unsigned long long)t->consumer.rpos, (unsigned long long)lag,
         (unsigned long long)atomic_load(&t->bytes_written),
         (unsigned long long)atomic_load(&t->blocks),
@@ -438,7 +463,7 @@ static void on_cmd(ph_ctrl_t *c, const char *line, void *user){
     if(ph_handle_subscribe_cmd(c,line,filesink_subscribe_cb,c)) return;
     if(ph_handle_unsubscribe_cmd(c,line,filesink_unsubscribe_cb,c)) return;
     if(strncmp(line,"help",4)==0){
-        ph_reply(c,"{\"ok\":true,\"help\":\"help|path <file>|iq-path <file>|audio-path <file>|pcm-path <file>|format raw|phcap|wav|audio-format raw|phcap|wav|iq-format raw|phcap|metadata none|jsonl|block <bytes>|append <0|1> (raw only)|start_at live|oldest|subscribe iq-source <feed>|subscribe pcm-source|audio-source <feed>|unsubscribe <usage>|start|stop|status\"}");
+        ph_reply(c,"{\"ok\":true,\"help\":\"help|path <file>|iq-path <file>|audio-path <file>|pcm-path <file>|format raw|phcap|wav|hex|audio-format raw|phcap|wav|hex|iq-format raw|phcap|hex|metadata none|jsonl|block <bytes>|append <0|1> (raw/hex only)|start_at live|oldest|subscribe iq-source <feed>|subscribe pcm-source|audio-source <feed>|unsubscribe <usage>|start|stop|status\"}");
         return;
     }
     if(strncmp(line,"iq-path ",8)==0){ const char *p=line+8; trim_left(&p); pthread_mutex_lock(&S.mu); set_target_path_locked(&S.iq,p); pthread_mutex_unlock(&S.mu); ph_reply_okf(c,"iq-path=%s",p); return; }
@@ -454,9 +479,9 @@ static void on_cmd(ph_ctrl_t *c, const char *line, void *user){
         ph_reply_okf(c,"path=%s",p);
         return;
     }
-    if(strncmp(line,"format ",7)==0){ const char *v=line+7; trim_left(&v); if(!strcasecmp(v,"raw")) S.file_fmt=FMT_RAW; else if(!strcasecmp(v,"phcap")) S.file_fmt=FMT_PHCAP; else if(!strcasecmp(v,"wav")) S.file_fmt=FMT_WAV; else {ph_reply_err(c,"format expects raw, phcap or wav");return;} ph_reply_okf(c,"format=%s",v); return; }
-    if(strncmp(line,"audio-format ",13)==0){ const char *v=line+13; trim_left(&v); file_fmt_t f; if(!strcasecmp(v,"raw")) f=FMT_RAW; else if(!strcasecmp(v,"phcap")) f=FMT_PHCAP; else if(!strcasecmp(v,"wav")) f=FMT_WAV; else {ph_reply_err(c,"audio-format expects raw, phcap or wav");return;} pthread_mutex_lock(&S.mu); S.au.file_fmt=f; S.au.file_fmt_set=1; pthread_mutex_unlock(&S.mu); ph_reply_okf(c,"audio-format=%s",v); return; }
-    if(strncmp(line,"iq-format ",10)==0){ const char *v=line+10; trim_left(&v); file_fmt_t f; if(!strcasecmp(v,"raw")) f=FMT_RAW; else if(!strcasecmp(v,"phcap")) f=FMT_PHCAP; else {ph_reply_err(c,"iq-format expects raw or phcap");return;} pthread_mutex_lock(&S.mu); S.iq.file_fmt=f; S.iq.file_fmt_set=1; pthread_mutex_unlock(&S.mu); ph_reply_okf(c,"iq-format=%s",v); return; }
+    if(strncmp(line,"format ",7)==0){ const char *v=line+7; trim_left(&v); if(!strcasecmp(v,"raw")) S.file_fmt=FMT_RAW; else if(!strcasecmp(v,"phcap")) S.file_fmt=FMT_PHCAP; else if(!strcasecmp(v,"wav")) S.file_fmt=FMT_WAV; else if(!strcasecmp(v,"hex")) S.file_fmt=FMT_HEX; else {ph_reply_err(c,"format expects raw, phcap, wav or hex");return;} ph_reply_okf(c,"format=%s",v); return; }
+    if(strncmp(line,"audio-format ",13)==0){ const char *v=line+13; trim_left(&v); file_fmt_t f; if(!strcasecmp(v,"raw")) f=FMT_RAW; else if(!strcasecmp(v,"phcap")) f=FMT_PHCAP; else if(!strcasecmp(v,"wav")) f=FMT_WAV; else if(!strcasecmp(v,"hex")) f=FMT_HEX; else {ph_reply_err(c,"audio-format expects raw, phcap, wav or hex");return;} pthread_mutex_lock(&S.mu); S.au.file_fmt=f; S.au.file_fmt_set=1; pthread_mutex_unlock(&S.mu); ph_reply_okf(c,"audio-format=%s",v); return; }
+    if(strncmp(line,"iq-format ",10)==0){ const char *v=line+10; trim_left(&v); file_fmt_t f; if(!strcasecmp(v,"raw")) f=FMT_RAW; else if(!strcasecmp(v,"phcap")) f=FMT_PHCAP; else if(!strcasecmp(v,"hex")) f=FMT_HEX; else {ph_reply_err(c,"iq-format expects raw, phcap or hex");return;} pthread_mutex_lock(&S.mu); S.iq.file_fmt=f; S.iq.file_fmt_set=1; pthread_mutex_unlock(&S.mu); ph_reply_okf(c,"iq-format=%s",v); return; }
     if(strncmp(line,"metadata ",9)==0){ const char *v=line+9; trim_left(&v); if(!strcasecmp(v,"none")) S.meta_mode=META_NONE; else if(!strcasecmp(v,"jsonl")||!strcasecmp(v,"sidecar")) S.meta_mode=META_JSONL; else {ph_reply_err(c,"metadata expects none or jsonl");return;} ph_reply_okf(c,"metadata=%s",v); return; }
     if(strncmp(line,"block ",6)==0){ uint64_t v; if(parse_u64(line+6,&v)||v<1){ph_reply_err(c,"bad block bytes");return;} S.block_bytes=(size_t)v; ph_reply_okf(c,"block=%zu",S.block_bytes); return; }
     if(strncmp(line,"append ",7)==0){ int v; if(parse_boolish(line+7,&v)){ph_reply_err(c,"bad append bool");return;} S.append=v; ph_reply_okf(c,"append=%d",S.append); return; }
@@ -466,7 +491,11 @@ static void on_cmd(ph_ctrl_t *c, const char *line, void *user){
         if(!S.iq.path[0] && !S.au.path[0]){ pthread_mutex_unlock(&S.mu); ph_reply_err(c,"set iq-path/audio-path/path before start"); return; }
         int err = 0;
         if(S.iq.path[0] && target_fmt(&S.iq)==FMT_WAV) err = EINVAL;
-        if(!err && S.append && ((S.iq.path[0] && target_fmt(&S.iq)!=FMT_RAW) || (S.au.path[0] && target_fmt(&S.au)!=FMT_RAW))) err = EINVAL;
+        if(!err && S.append){
+            file_fmt_t iqf=target_fmt(&S.iq), auf=target_fmt(&S.au);
+            if((S.iq.path[0] && iqf!=FMT_RAW && iqf!=FMT_HEX) ||
+               (S.au.path[0] && auf!=FMT_RAW && auf!=FMT_HEX)) err = EINVAL;
+        }
         if(!err && S.iq.path[0] && target_open_outputs_locked(&S.iq)!=0) err = errno ? errno : EIO;
         if(!err && S.au.path[0] && target_open_outputs_locked(&S.au)!=0) err = errno ? errno : EIO;
         if(err){
@@ -492,8 +521,11 @@ static void on_cmd(ph_ctrl_t *c, const char *line, void *user){
         status_target_json(aujs,sizeof aujs,"audio",&S.au);
         pthread_mutex_unlock(&S.mu);
         char js[3600];
+        const char *gfmtstr = S.file_fmt==FMT_PHCAP?"phcap":
+                              (S.file_fmt==FMT_WAV?"wav":
+                              (S.file_fmt==FMT_HEX?"hex":"raw"));
         snprintf(js,sizeof js,"{\"ok\":true,\"active\":%d,\"format\":\"%s\",\"metadata\":\"%s\",\"append\":%d,\"start_at\":\"%s\",\"block_bytes\":%zu,%s,%s}",
-                 atomic_load(&S.active), S.file_fmt==FMT_PHCAP?"phcap":(S.file_fmt==FMT_WAV?"wav":"raw"), S.meta_mode==META_JSONL?"jsonl":"none", S.append, S.start_oldest?"oldest":"live", S.block_bytes, iqjs, aujs);
+                 atomic_load(&S.active), gfmtstr, S.meta_mode==META_JSONL?"jsonl":"none", S.append, S.start_oldest?"oldest":"live", S.block_bytes, iqjs, aujs);
         ph_reply(c,js); return;
     }
     ph_reply_err(c,"unknown");

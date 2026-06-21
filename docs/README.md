@@ -53,5 +53,6 @@ src/addons/              bundled addons
   filesink/              IQ/audio capture sink
   dummy/                 reference addon
 tools/cli.c              ph-cli
+tools/waterfall.c        ph-waterfall — OpenGL 3.3 waterfall+spectrum viewer (make waterfall)
 wfmd-*.sh                live/replay convenience workflows
 ```

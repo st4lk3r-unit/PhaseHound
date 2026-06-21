@@ -17,6 +17,7 @@
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <sys/un.h>
+#include <execinfo.h>
 
 #include "ph_version.h"
 #ifndef PH_GIT_SHA
@@ -68,7 +69,12 @@ static int plugtab_find(plugtab_t *t, const char *name){
     return -1;
 }
 static void plugtab_add(plugtab_t *t, plug_t p){
-    if(t->n==t->cap){ size_t nc=t->cap? t->cap*2:4; t->v=realloc(t->v,nc*sizeof(plug_t)); t->cap=nc; }
+    if(t->n==t->cap){
+        size_t nc=t->cap? t->cap*2:4;
+        plug_t *nv = realloc(t->v, nc*sizeof(plug_t));
+        if(!nv){ log_msg(LOG_ERROR, "plugtab_add: OOM — plugin not registered"); return; }
+        t->v=nv; t->cap=nc;
+    }
     t->v[t->n++] = p;
 }
 static void plugtab_remove(plugtab_t *t, size_t idx){
@@ -81,21 +87,41 @@ static void plugtab_remove(plugtab_t *t, size_t idx){
 static volatile sig_atomic_t g_run = 1;
 static void on_sigint(int s){ (void)s; g_run = 0; }
 
+static void crash_handler(int sig) {
+    void *bt[64];
+    int n = backtrace(bt, 64);
+    char **syms = backtrace_symbols(bt, n);
+    dprintf(STDERR_FILENO, "\n[ph-core] FATAL signal %d — backtrace:\n", sig);
+    for (int i = 0; i < n; i++)
+        dprintf(STDERR_FILENO, "  %s\n", syms ? syms[i] : "?");
+    free(syms);
+    signal(sig, SIG_DFL);
+    raise(sig);
+}
+
 static feedtab_t g_feeds;
 static plugtab_t g_plugins;
 static int g_listen_fd = -1;
+static int g_client_count = 0;
+#define PH_MAX_CLIENTS 512
 
 /* ========= Feeds ========= */
+
+/* RT pipeline can have many consumers on a feed (TDOA array elements, etc.) */
+#define PH_MAX_SNAP_SUBS 1024
 
 static void broadcast_to_subs(const char *feed, const char *json, size_t len, int *fds, size_t nfds){
     /* Snapshot subscriber list under lock, then send outside lock.
        Prevents a slow subscriber from blocking all others. */
-    int snap[256]; size_t snap_n = 0;
+    int snap[PH_MAX_SNAP_SUBS]; size_t snap_n = 0;
     pthread_mutex_lock(&g_feeds.mu);
     for(size_t i = 0; i < g_feeds.n; i++){
         if(strcmp(g_feeds.v[i].name, feed) == 0){
             intvec_t *iv = &g_feeds.v[i].subs;
-            snap_n = iv->n < 256 ? iv->n : 256;
+            if(iv->n > PH_MAX_SNAP_SUBS)
+                log_msg(LOG_WARN, "feed %s: %zu subscribers exceed snapshot cap %d; extras dropped",
+                        feed, iv->n, PH_MAX_SNAP_SUBS);
+            snap_n = iv->n < PH_MAX_SNAP_SUBS ? iv->n : PH_MAX_SNAP_SUBS;
             for(size_t j = 0; j < snap_n; j++) snap[j] = iv->v[j];
             break;
         }
@@ -112,6 +138,12 @@ static void broadcast_to_subs(const char *feed, const char *json, size_t len, in
 
 /* ========= Add-on discovery (autoload) ========= */
 
+/* Match only unversioned .so files — strstr would hit libfoo.so.1.2.3 */
+static int name_ends_with_so(const char *name){
+    size_t n = strlen(name);
+    return n > 3 && strcmp(name + n - 3, ".so") == 0;
+}
+
 static int scan_addon_paths(char paths[][512], int maxn){
     int n=0;
     const char *roots[] = {"./src/addons", "./addons", "./"};
@@ -123,7 +155,7 @@ static int scan_addon_paths(char paths[][512], int maxn){
             if(de->d_name[0]=='.') continue;
             char sub[512];
             int ok = snprintf(sub, sizeof sub, "%s/%s", roots[r], de->d_name);
-            if(ok < 0 || (size_t)ok >= sizeof sub) continue; // trunc guard
+            if(ok < 0 || (size_t)ok >= sizeof sub) continue;
 
             struct stat st; if(stat(sub,&st)<0) continue;
             if(S_ISDIR(st.st_mode)){
@@ -131,17 +163,17 @@ static int scan_addon_paths(char paths[][512], int maxn){
                 struct dirent *de2;
                 while((de2=readdir(d2))){
                     if(de2->d_name[0]=='.') continue;
-                    if(!strstr(de2->d_name,".so")) continue;
+                    if(!name_ends_with_so(de2->d_name)) continue;
                     char so[512];
                     ok = snprintf(so, sizeof so, "%s/%s", sub, de2->d_name);
-                    if(ok < 0 || (size_t)ok >= sizeof so) continue; // trunc guard
+                    if(ok < 0 || (size_t)ok >= sizeof so) continue;
                     if(access(so,R_OK)==0 && n<maxn){
                         path_copy(paths[n++], 512, so);
                     }
                 }
                 closedir(d2);
             } else if(S_ISREG(st.st_mode)){
-                if(strstr(sub,".so") && access(sub,R_OK)==0 && n<maxn){
+                if(name_ends_with_so(de->d_name) && access(sub,R_OK)==0 && n<maxn){
                     path_copy(paths[n++], 512, sub);
                 }
             }
@@ -209,11 +241,7 @@ static int load_plugin_from_path(const char *so_path){
         return 1; /* not an error, just a skip */
     }
 
-    if (path_copy(p.path, sizeof p.path, so_path) != 0) {
-        log_msg(LOG_WARN, "path truncated for %s", p.name);
-        /* still proceed; p.path is empty or truncated */
-        snprintf(p.path, sizeof p.path, "%s", so_path); // best effort, snprintf is fine here
-    }
+    snprintf(p.path, sizeof p.path, "%s", so_path);
 
     /* Build ctx for ABI 1.0 */
     plugin_ctx_t ctx = {
@@ -327,10 +355,12 @@ static void handle_msg(int fd, const char *js, int *fds, size_t nfds){
         } else if(strcmp(cmd,"plugins")==0 || strcmp(cmd,"list addons")==0){
             char buf[POC_MAX_JSON];
             for(size_t i=0;i<g_plugins.n;i++){
+                char ne[128], pe[1024];
+                ph_json_escape_string(g_plugins.v[i].name, ne, sizeof ne);
+                ph_json_escape_string(g_plugins.v[i].path[0]?g_plugins.v[i].path:"", pe, sizeof pe);
                 int len = snprintf(buf, sizeof buf, "{\"type\":\"info\",\"plugin\":\"%s\",\"path\":\"%s\"}",
-                                   g_plugins.v[i].name,
-                                   g_plugins.v[i].path[0]?g_plugins.v[i].path:"");
-                send_frame_json(fd, buf, (size_t)len);
+                                   ne, pe);
+                if(len > 0 && (size_t)len < sizeof buf) send_frame_json(fd, buf, (size_t)len);
             }
 
         } else if(strcmp(cmd,"available-addons")==0){
@@ -389,23 +419,30 @@ static void handle_msg(int fd, const char *js, int *fds, size_t nfds){
 /* ========= JSON list helper ========= */
 
 static void json_send_kv_list(int fd, const char *type, const char *key, char **items, int n){
-    char buf[POC_MAX_JSON]; size_t pos=0;
-    pos += (size_t)snprintf(buf+pos, sizeof buf - pos, "{\"type\":\"%s\",\"%s\":[", type, key);
+    char buf[POC_MAX_JSON]; size_t pos=0; int w;
+    w = snprintf(buf, sizeof buf, "{\"type\":\"%s\",\"%s\":[", type, key);
+    if(w < 0 || (size_t)w >= sizeof buf) return;
+    pos = (size_t)w;
     for(int i=0;i<n;i++){
         char esc[512];
         ph_json_escape_string(items[i], esc, sizeof esc);
         const char *comma = (i+1<n)?",":"";
-        pos += (size_t)snprintf(buf+pos, sizeof buf - pos, "\"%s\"%s", esc, comma);
+        w = snprintf(buf+pos, sizeof buf - pos, "\"%s\"%s", esc, comma);
+        if(w < 0 || (size_t)w >= sizeof buf - pos) break;
+        pos += (size_t)w;
     }
-    pos += (size_t)snprintf(buf+pos, sizeof buf - pos, "]}");
+    if(pos + 2 < sizeof buf){ buf[pos++]=']'; buf[pos++]='}'; }
     send_frame_json(fd, buf, pos);
 }
 
 /* ========= Main ========= */
 
 int main(void){
-    signal(SIGINT, on_sigint);
+    signal(SIGINT,  on_sigint);
     signal(SIGTERM, on_sigint);
+    signal(SIGSEGV, crash_handler);
+    signal(SIGABRT, crash_handler);
+    signal(SIGBUS,  crash_handler);
     feedtab_init(&g_feeds);
     plugtab_init(&g_plugins);
 
@@ -438,15 +475,21 @@ int main(void){
             if(fd == g_listen_fd){
                 int cfd = accept(g_listen_fd, NULL, NULL);
                 if(cfd >= 0){
-                    set_nonblock(cfd);
-                    struct epoll_event cev = {0};
-                    cev.events = EPOLLIN;
-                    cev.data.fd = cfd;
-                    if(epoll_ctl(epfd, EPOLL_CTL_ADD, cfd, &cev) < 0){
-                        log_msg(LOG_ERROR,"epoll_ctl add: %s", strerror(errno));
+                    if(g_client_count >= PH_MAX_CLIENTS){
+                        log_msg(LOG_WARN, "client limit %d reached, rejecting fd=%d", PH_MAX_CLIENTS, cfd);
                         close(cfd);
                     } else {
-                        log_msg(LOG_INFO,"client connected fd=%d", cfd);
+                        set_nonblock(cfd);
+                        struct epoll_event cev = {0};
+                        cev.events = EPOLLIN;
+                        cev.data.fd = cfd;
+                        if(epoll_ctl(epfd, EPOLL_CTL_ADD, cfd, &cev) < 0){
+                            log_msg(LOG_ERROR,"epoll_ctl add: %s", strerror(errno));
+                            close(cfd);
+                        } else {
+                            g_client_count++;
+                            log_msg(LOG_INFO,"client connected fd=%d (total=%d)", cfd, g_client_count);
+                        }
                     }
                 }
             } else {
@@ -455,7 +498,8 @@ int main(void){
                 size_t anccnt = sizeof(ancfds)/sizeof(ancfds[0]);
                 int got = recv_frame_json_with_fds(fd, js, sizeof js-1, ancfds, &anccnt, 10);
                 if(got <= 0){
-                    log_msg(LOG_INFO,"client fd=%d disconnected", fd);
+                    g_client_count--;
+                    log_msg(LOG_INFO,"client fd=%d disconnected (total=%d)", fd, g_client_count);
                     feedtab_unsub_all_fd(&g_feeds, fd);
                     epoll_ctl(epfd, EPOLL_CTL_DEL, fd, NULL);
                     close(fd);

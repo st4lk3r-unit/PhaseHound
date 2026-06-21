@@ -20,7 +20,13 @@ CLI_BIN   = ph-cli
 GIT_SHA := $(shell git rev-parse --short=7 HEAD 2>/dev/null || echo unknown)
 CFLAGS  += -DPH_GIT_SHA=\"$(GIT_SHA)\"
 
-.PHONY: all clean addons install
+WATERFALL_BIN  := ph-waterfall
+WATERFALL_SRCS := tools/waterfall.c src/common.c src/dsp/ph_dsp.c \
+                  src/common/ph_ring.c src/common/ph_shm.c
+WF_CFLAGS := $(shell pkg-config --cflags glfw3 2>/dev/null)
+WF_LIBS   := $(shell pkg-config --libs   glfw3 2>/dev/null) -lGL -lm
+
+.PHONY: all clean addons install waterfall
 
 all: $(CORE_BIN) $(CLI_BIN) addons
 
@@ -39,11 +45,16 @@ addons:
 	done
 
 clean:
-	rm -f $(CORE_OBJS) $(CLI_OBJS) $(CORE_BIN) $(CLI_BIN)
+	rm -f $(CORE_OBJS) $(CLI_OBJS) $(CORE_BIN) $(CLI_BIN) $(WATERFALL_BIN)
 	@find src tools -type f -name '*.o' -delete
 	@for d in $(wildcard src/addons/*); do \
 	  if [ -f $$d/Makefile ]; then echo "[addons] cleaning $$d"; $(MAKE) -C $$d clean; fi; \
 	done
+
+waterfall: $(WATERFALL_SRCS)
+	$(CC) $(PH_CFLAGS) $(CFLAGS) $(INCS) $(WF_CFLAGS) $(WATERFALL_SRCS) \
+	  -o $(WATERFALL_BIN) $(LDFLAGS) $(PH_LDFLAGS) $(WF_LIBS)
+	@echo "[waterfall] built $(WATERFALL_BIN)"
 
 install:
 	install -m755 $(CORE_BIN) $(PREFIX)/bin/$(CORE_BIN)

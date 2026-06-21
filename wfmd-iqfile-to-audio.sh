@@ -135,6 +135,7 @@ fi
 
 CORE_PID=""
 SUB_PID=""
+WF_PID=""
 CLEANED=0
 cleanup() {
   [ "$CLEANED" -eq 1 ] && return
@@ -144,6 +145,10 @@ cleanup() {
   pub audiosink.config.in "stop" >/dev/null 2>&1 || true
   pub wfmd.config.in "stop" >/dev/null 2>&1 || true
   pub filesource.config.in "stop" >/dev/null 2>&1 || true
+  if [ -n "${WF_PID:-}" ]; then
+    kill "$WF_PID" >/dev/null 2>&1 || true
+    wait "$WF_PID" >/dev/null 2>&1 || true
+  fi
   if [ -n "${SUB_PID:-}" ]; then
     kill "$SUB_PID" >/dev/null 2>&1 || true
     wait "$SUB_PID" >/dev/null 2>&1 || true
@@ -236,6 +241,14 @@ if [ "$IN_FORMAT" = "raw" ]; then
   pub filesource.config.in "cf $CF"
   pub filesource.config.in "metadata latest"
 fi
+# Start waterfall BEFORE filesource publishes the ring so it receives the memfd.
+if [ -x ./ph-waterfall ]; then
+  ./ph-waterfall --feed filesource.IQ-info &
+  WF_PID=$!
+  echo "[waterfall] launched (PID=$WF_PID) — close window or press Q to stop"
+  sleep 0.15   # give recv_thread time to connect and subscribe
+fi
+
 pub filesource.config.in "start"
 
 printf '\nWFMD replay:\n  IQ in:  %s (%s)\n  Audio:  %s (%s)\n' "$IQ_IN" "$IN_FORMAT" "$OUT" "$OUT_FORMAT"

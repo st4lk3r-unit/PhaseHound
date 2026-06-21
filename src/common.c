@@ -12,6 +12,7 @@
 #include <sys/un.h>
 #include <arpa/inet.h>
 #include <time.h>
+#include <limits.h>
 
 static const char *lvl_name(int lvl){
     switch(lvl){
@@ -73,15 +74,33 @@ int uds_connect(const char *path){
     return fd;
 }
 
+// ---- deadline helpers (monotonic clock, no per-iteration timeout reset) ----
+static int64_t make_deadline_ns(int timeout_ms){
+    if(timeout_ms < 0) return -1;
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec * 1000000000LL + (int64_t)ts.tv_nsec
+           + (int64_t)timeout_ms * 1000000LL;
+}
+static int deadline_ms_left(int64_t dl){
+    if(dl < 0) return -1;
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    int64_t rem = dl - ((int64_t)ts.tv_sec * 1000000000LL + (int64_t)ts.tv_nsec);
+    if(rem <= 0) return 0;
+    int64_t ms = rem / 1000000LL;
+    return (int)(ms > INT_MAX ? INT_MAX : ms);
+}
+
 // ---- framing ----
-static int read_full(int fd, void *buf, size_t len, int timeout_ms){
+static int read_full_dl(int fd, void *buf, size_t len, int64_t dl){
     size_t off = 0;
     while(off < len){
-        fd_set r;
-        FD_ZERO(&r);
-        FD_SET(fd, &r);
-        struct timeval tv = { .tv_sec = timeout_ms/1000, .tv_usec = (timeout_ms%1000)*1000 };
-        int rc = select(fd+1, &r, NULL, NULL, timeout_ms>=0? &tv: NULL);
+        int rem = deadline_ms_left(dl);
+        if(rem == 0) return -1;
+        fd_set r; FD_ZERO(&r); FD_SET(fd, &r);
+        struct timeval tv = { .tv_sec = rem/1000, .tv_usec = (rem%1000)*1000 };
+        int rc = select(fd+1, &r, NULL, NULL, dl<0? NULL: &tv);
         if(rc <= 0){ if(errno==EINTR) continue; return -1; }
         ssize_t got = read(fd, (char*)buf+off, len-off);
         if(got <= 0) return -1;
@@ -124,11 +143,12 @@ int send_frame_json(int fd, const char *json_str, size_t len){
 }
 
 int recv_frame_json(int fd, char *buf, size_t bufcap, int timeout_ms){
+    int64_t dl = make_deadline_ns(timeout_ms);
     uint32_t be;
-    if(read_full(fd, &be, 4, timeout_ms) < 0) return -1;
+    if(read_full_dl(fd, &be, 4, dl) < 0) return -1;
     uint32_t len = ntohl(be);
     if(len >= bufcap) return -1;
-    if(read_full(fd, buf, len, timeout_ms) < 0) return -1;
+    if(read_full_dl(fd, buf, len, dl) < 0) return -1;
     buf[len] = '\0';
     return (int)len;
 }
@@ -226,13 +246,26 @@ void feedtab_unsub(feedtab_t *t, const char *name, int fd){
     pthread_mutex_unlock(&t->mu);
 }
 void feedtab_list(feedtab_t *t, int fd){
-    char buf[POC_MAX_JSON];
+    /* Snapshot under lock so we never hold the mutex during socket I/O.
+     * A blocked sender could otherwise stall every publish/subscribe on this broker. */
+    typedef struct { char name[POC_MAX_FEED]; size_t subs_n; } snap_t;
+    snap_t snap[128];
+    size_t snap_n;
     pthread_mutex_lock(&t->mu);
-    for(size_t i=0;i<t->n;i++){
-        int len = snprintf(buf, sizeof buf, "{\"type\":\"info\",\"feed\":\"%s\",\"subs\":%zu}", t->v[i].name, t->v[i].subs.n);
-        send_frame_json(fd, buf, (size_t)len);
+    snap_n = t->n < 128 ? t->n : 128;
+    for(size_t i=0;i<snap_n;i++){
+        memcpy(snap[i].name, t->v[i].name, POC_MAX_FEED);
+        snap[i].subs_n = t->v[i].subs.n;
     }
     pthread_mutex_unlock(&t->mu);
+
+    char buf[POC_MAX_JSON];
+    for(size_t i=0;i<snap_n;i++){
+        int len = snprintf(buf, sizeof buf, "{\"type\":\"info\",\"feed\":\"%s\",\"subs\":%zu}",
+                           snap[i].name, snap[i].subs_n);
+        if(len > 0 && (size_t)len < sizeof buf)
+            send_frame_json(fd, buf, (size_t)len);
+    }
 }
 
 // ---- compact JSON field reader for the flat control protocol ----
@@ -371,6 +404,7 @@ int b64_encode(const uint8_t *in, size_t inlen, char *out, size_t *outlen){
         out[j++] = (i+1<inlen)? B64[(v>>6)&63] : '=';
         out[j++] = (i+2<inlen)? B64[v&63] : '=';
     }
+    out[j] = '\0';  /* caller buffer must be b64_encoded_len(n)+1 bytes */
     return 0;
 }
 
@@ -441,12 +475,14 @@ int send_frame_json_with_fds(int fd, const char *json_str, size_t len, const int
 
 }
 
-static int recv_all_timeout(int fd, void *buf, size_t len, int timeout_ms){
+static int recv_all_dl(int fd, void *buf, size_t len, int64_t dl){
     uint8_t *p=(uint8_t*)buf; size_t off=0;
     while(off<len){
+        int rem = deadline_ms_left(dl);
+        if(rem == 0) return -1;
         fd_set rfds; FD_ZERO(&rfds); FD_SET(fd,&rfds);
-        struct timeval tv={ .tv_sec=timeout_ms/1000, .tv_usec=(timeout_ms%1000)*1000 };
-        int r = select(fd+1, &rfds, NULL, NULL, timeout_ms<0?NULL:&tv);
+        struct timeval tv={ .tv_sec=rem/1000, .tv_usec=(rem%1000)*1000 };
+        int r = select(fd+1, &rfds, NULL, NULL, dl<0?NULL:&tv);
         if(r==0) return -1;
         if(r<0){ if(errno==EINTR) continue; return -1; }
         ssize_t g = recv(fd, p+off, len-off, 0);
@@ -459,8 +495,9 @@ static int recv_all_timeout(int fd, void *buf, size_t len, int timeout_ms){
 
 int recv_frame_json_with_fds(int fd, char *json_out, size_t outcap,
                              int *fds_out, size_t *nfds_inout, int timeout_ms){
+    int64_t dl = make_deadline_ns(timeout_ms);
     uint32_t be = 0;
-    if(recv_all_timeout(fd, &be, 4, timeout_ms)<0) return -1;
+    if(recv_all_dl(fd, &be, 4, dl)<0) return -1;
     uint32_t len = ntohl(be);
     if(len >= outcap) return -1;
 
@@ -468,9 +505,11 @@ int recv_frame_json_with_fds(int fd, char *json_out, size_t outcap,
     size_t gotfds = 0;
     size_t off = 0;
     while(off < len){
+        int rem = deadline_ms_left(dl);
+        if(rem == 0) return -1;
         fd_set rfds; FD_ZERO(&rfds); FD_SET(fd,&rfds);
-        struct timeval tv={ .tv_sec=timeout_ms/1000, .tv_usec=(timeout_ms%1000)*1000 };
-        int r = select(fd+1,&rfds,NULL,NULL,timeout_ms<0?NULL:&tv);
+        struct timeval tv={ .tv_sec=rem/1000, .tv_usec=(rem%1000)*1000 };
+        int r = select(fd+1,&rfds,NULL,NULL,dl<0?NULL:&tv);
         if(r==0) return -1;
         if(r<0){ if(errno==EINTR) continue; return -1; }
 

@@ -18,7 +18,8 @@
 - ordered publish dispatch acknowledgements for transient CLI clients,
 - partial-I/O-safe framed UDS and `SCM_RIGHTS` transport,
 - escaped control JSON round-trip handling,
-- GitHub Actions release bundle generation.
+- GitHub Actions release bundle generation,
+- OpenGL 3.3 waterfall + spectrum viewer with inferno colourmap, auto-gain, and cursor frequency/dB readout.
 
 ## Near-term
 

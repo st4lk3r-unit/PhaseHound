@@ -5,6 +5,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <signal.h>
+#include <poll.h>
 
 static void usage(void){
     fprintf(stderr, "ph-cli usage:\n");
@@ -18,16 +19,7 @@ static void usage(void){
 }
 
 static int extract_feed(const char *js, char *out, size_t cap){
-    const char *p = strstr(js, "\"feed\":\"");
-    if(!p) return -1;
-    p += 8;
-    const char *q = strchr(p, '"');
-    if(!q) return -1;
-    size_t n = (size_t)(q - p);
-    if(n >= cap) n = cap - 1;
-    memcpy(out, p, n);
-    out[n] = '\0';
-    return 0;
+    return json_get_string(js, "feed", out, cap);
 }
 
 int main(int argc, char **argv){
@@ -63,7 +55,17 @@ int main(int argc, char **argv){
         while(1){
             char js[POC_MAX_JSON];
             int got = recv_frame_json(fd, js, sizeof js, 2000);
-            if(got<=0) continue;
+            if(got <= 0){
+                /* recv_frame_json returns -1 on both timeout and real disconnect.
+                 * Use poll(POLLHUP) to tell them apart: exit only on actual EOF. */
+                struct pollfd pfd = { .fd = fd, .events = 0 };
+                poll(&pfd, 1, 0);
+                if(pfd.revents & POLLHUP){
+                    fprintf(stderr, "[ph-cli] server disconnected, exiting\n");
+                    break;
+                }
+                continue; /* silence — broker alive, keep listening */
+            }
             char tag[128];
             if(extract_feed(js, tag, sizeof tag)==0)
                 fprintf(stdout, "[%s] %s\n", tag, js);

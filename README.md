@@ -23,6 +23,7 @@ RF/file source -> DSP or decoder -> audio/file/event sink
 - ALSA audio sink.
 - Raw/`phcap` file replay and raw/`phcap`/WAV capture.
 - Simultaneous IQ and demodulated-audio capture with independent cursors.
+- OpenGL 3.3 real-time waterfall + spectrum viewer (`ph-waterfall`).
 - Shared DSP primitives under `src/dsp/`.
 
 The broker never carries continuous sample payloads through JSON. JSON and UDS are used for control and ring announcements; samples remain in SHM.
@@ -89,12 +90,14 @@ Optional addon dependencies:
 
 - SoapySDR development files for `soapy`.
 - ALSA development files for `audiosink`.
+- GLFW 3 + libGL development files for the `ph-waterfall` viewer.
 
 On Ubuntu/Debian:
 
 ```bash
-sudo apt install build-essential pkg-config libsoapysdr-dev libasound2-dev
-make -j"$(nproc)"
+sudo apt install build-essential pkg-config libsoapysdr-dev libasound2-dev libglfw3-dev
+make -j"$(nproc)"          # builds core, CLI, and all addons
+make waterfall             # optional: builds ph-waterfall (requires GLFW)
 ```
 
 The top-level `make` builds the core, CLI, and every bundled addon. Optional addons are skipped when their development package is absent. Use this in CI or release builds to require all optional backends:
@@ -109,6 +112,7 @@ Main artifacts:
 ph-core
 ph-cli
 src/addons/*/ph-lib*.so
+ph-waterfall               (optional, built with: make waterfall)
 ```
 
 ## Run
@@ -170,7 +174,7 @@ Configure the SDR, then wire consumers before starting producers:
 
 # Start processing and playback.
 ./ph-cli pub wfmd.config.in "gain 0.5"
-./ph-cli pub wfmd.config.in "bw 150000"
+./ph-cli pub wfmd.config.in "bw 110000"   # 110 kHz fits within 240 kHz Nyquist of the channel
 ./ph-cli pub wfmd.config.in "start"
 ./ph-cli pub audiosink.config.in "start"
 ```
@@ -182,13 +186,37 @@ To attach a consumer after streaming has already started:
 ./ph-cli pub wfmd.config.in "open"
 ```
 
-The convenience script runs the same live pipeline and can capture IQ plus audio:
+The convenience script runs the same live pipeline, captures IQ plus audio, and launches
+the waterfall viewer automatically if `ph-waterfall` is present in the working directory:
 
 ```bash
 DURATION=30 CF=100.0e6 ./wfmd-96-audiosink.sh
 ```
 
 Default outputs are a `phcap` IQ file and a WAV audio file under `captures/`.
+
+## Waterfall viewer
+
+`ph-waterfall` renders a scrolling power-spectrum waterfall and a live spectrum pane
+(power vs. frequency) via OpenGL 3.3.  It connects to ph-core and subscribes to any
+IQ ring feed.
+
+```bash
+./ph-waterfall --feed soapy.IQ-info
+./ph-waterfall --feed filesource.IQ-info --fft 4096 --rows 4096
+```
+
+Keys:
+
+| Key | Action |
+|-----|--------|
+| `A` | Auto-set colour range from live signal percentiles |
+| `+` / `-` | Raise / lower upper dB limit by 5 |
+| `[` / `]` | Lower / raise lower dB limit by 5 |
+| `Q` / Esc | Quit |
+
+The window title updates ~10 Hz with the frequency and power level under the cursor.
+The convenience scripts launch the viewer automatically when the binary is present.
 
 ## File replay and capture
 
@@ -255,6 +283,7 @@ Implemented now:
 - file source/sink, dual capture, WAV output, and `phcap` replay,
 - timestamp propagation and real-time status counters,
 - ordered broker dispatch acknowledgements and partial-I/O-safe framed transport,
+- OpenGL 3.3 waterfall + spectrum viewer with auto-gain and cursor readout,
 - GitHub Actions release build.
 
 Still evolving:

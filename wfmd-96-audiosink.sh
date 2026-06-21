@@ -17,7 +17,7 @@ DEVICE=${DEVICE:-0}
 CF=${CF:-96.0e6}
 SR=${SR:-2400000}
 RF_BW=${RF_BW:-1.5e6}
-WFMD_BW=${WFMD_BW:-150000}
+WFMD_BW=${WFMD_BW:-110000}
 GAIN=${GAIN:-0.5}
 OUT_DIR=${OUT_DIR:-captures}
 FORMAT=${FORMAT:-phcap}        # phcap or raw (IQ capture format)
@@ -47,6 +47,7 @@ fi
 
 CORE_PID=""
 SUB_PID=""
+WF_PID=""
 CLEANED=0
 cleanup() {
   [ "$CLEANED" -eq 1 ] && return
@@ -60,6 +61,10 @@ cleanup() {
   pub audiosink.config.in "stop" >/dev/null 2>&1 || true
   pub wfmd.config.in "stop" >/dev/null 2>&1 || true
   pub soapy.config.in "stop" >/dev/null 2>&1 || true
+  if [ -n "${WF_PID:-}" ]; then
+    kill "$WF_PID" >/dev/null 2>&1 || true
+    wait "$WF_PID" >/dev/null 2>&1 || true
+  fi
   if [ -n "${SUB_PID:-}" ]; then
     kill "$SUB_PID" >/dev/null 2>&1 || true
     wait "$SUB_PID" >/dev/null 2>&1 || true
@@ -142,6 +147,14 @@ fi
 pub wfmd.config.in "open"
 pub wfmd.config.in "gain $GAIN"
 pub wfmd.config.in "bw $WFMD_BW"
+
+# Start waterfall before soapy so it receives the IQ ring memfd on publish.
+if [ -x ./ph-waterfall ]; then
+  ./ph-waterfall --feed soapy.IQ-info &
+  WF_PID=$!
+  echo "[waterfall] launched (PID=$WF_PID) — close window or press Q to stop"
+  sleep 0.15   # give recv_thread time to connect and subscribe
+fi
 
 # Publish IQ memfd after subscribers are attached, then start the real-time path.
 pub soapy.config.in "start"

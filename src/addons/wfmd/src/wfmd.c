@@ -64,7 +64,7 @@ static _Atomic bool g_swapiq = false;   // swap I/Q
 static _Atomic bool g_flipq  = false;   // flip sign of Q
 static _Atomic bool g_neg    = false;   // negate discriminator
 static _Atomic bool g_deemph = true;    // apply deemphasis
-static _Atomic int  g_taps1  = 101;     // first post-disc LPF taps (odd)
+static _Atomic int  g_taps1  = 201;     // first post-disc LPF taps (odd)
 static _Atomic int  g_debug  = 0;       // periodic diagnostics
 
 static _Atomic float  g_gain = 4.0f;    // now atomic to avoid races
@@ -332,6 +332,19 @@ static int       ch_inited=0, ainit=0;
 static double    last_fs_in=0, last_bw=0, last_fo=0;
 static int       last_D1=0, last_D2=0, last_taps1=0;
 static float     dc_x1=0.0f, dc_y1=0.0f;
+/* IIR/discriminator feedback states — file-scope so stop/restart is clean */
+static float     dsp_ip=0.0f, dsp_qp=0.0f;  /* previous IQ sample for atan2 discriminator */
+static float     dsp_y_em=0.0f;              /* de-emphasis IIR state */
+static unsigned  dsp_dbg_ctr=0;             /* periodic debug print counter */
+
+static void demod_state_reset(void){
+    cfirdec_free(&rf_ch); firdec_free(&a1); firdec_free(&a2);
+    ch_inited=0; ainit=0;
+    last_fs_in=0.0; last_bw=0.0; last_fo=0.0;
+    last_D1=0; last_D2=0; last_taps1=0;
+    dc_x1=0.0f; dc_y1=0.0f;
+    dsp_ip=0.0f; dsp_qp=0.0f; dsp_y_em=0.0f; dsp_dbg_ctr=0;
+}
 
 static void push_audio(const float *y, size_t n){ ring_push_f32(&g_ring, y, n); }
 
@@ -382,15 +395,14 @@ static void demod_block(const float *iq, size_t nsamp, double fs_in){
 
     /* ---- Discriminator at fs_ch ---- */
     if(ensure_cap(&g_wb.dphi, &g_wb.dphi_cap, nbb)) return;
-    static float ip=0.0f, qp=0.0f;
     const bool neg = atomic_load(&g_neg);
     for(size_t i=0;i<nbb;i++){
         float I0=g_wb.bb[2*i+0], Q0=g_wb.bb[2*i+1];
-        float re = ip*I0 + qp*Q0;
-        float im = ip*Q0 - qp*I0;
+        float re = dsp_ip*I0 + dsp_qp*Q0;
+        float im = dsp_ip*Q0 - dsp_qp*I0;
         float ph = (re==0.0f && im==0.0f) ? 0.0f : atan2f(im, re);
         g_wb.dphi[i]  = neg ? -ph : ph;
-        ip = I0; qp = Q0;
+        dsp_ip = I0; dsp_qp = Q0;
     }
 
     /* ---- Stage B: audio LP + decimate to ~48 kHz ---- */
@@ -410,7 +422,8 @@ static void demod_block(const float *iq, size_t nsamp, double fs_in){
         /* Correct anti-alias cutoffs:
            a1 runs at fs_ch and decimates by D1 → fc1 ≤ 0.45*(fs_ch/D1).
            a2 runs at fs1 and decimates by D2 → fc2 ≤ 0.45*(fs1/D2), also cap ~17 kHz for audio shape. */
-        float fc1 = (float)(0.45 * (fs_ch / (double)D1));
+        /* Cap at 15 kHz: rejects the 19 kHz stereo pilot that causes harsh audio */
+        float fc1 = fminf((float)(0.45 * (fs_ch / (double)D1)), 15000.0f);
         float fc2 = (float)(0.45 * (fs1   / (double)D2));
         if(fc2 > 17000.0f) fc2 = 17000.0f;
 
@@ -441,7 +454,6 @@ static void demod_block(const float *iq, size_t nsamp, double fs_in){
     /* de-emphasis (single-pole IIR) + DC blocker + gain + clip */
     int tau_us = atomic_load(&g_tau_us); if(tau_us!=50 && tau_us!=75) tau_us=50;
     float a = expf((float)(-1.0/(Fs_audio*((float)tau_us*1e-6f))));
-    static float y_em = 0.0f;
     const bool do_deemph = atomic_load(&g_deemph);
     const float gain = atomic_load(&g_gain);
     for(size_t i=0;i<n2;i++){
@@ -449,8 +461,8 @@ static void demod_block(const float *iq, size_t nsamp, double fs_in){
         /* DC blocker */
         const float r=0.995f; float ydc = xin - dc_x1 + r*dc_y1; dc_x1=xin; dc_y1=ydc;
         float x = ydc;
-        if(do_deemph) y_em = a*y_em + (1.0f - a)*x; else y_em = x;
-        float y = gain * y_em;
+        if(do_deemph) dsp_y_em = a*dsp_y_em + (1.0f - a)*x; else dsp_y_em = x;
+        float y = gain * dsp_y_em;
         if(y >  1.0f) y =  1.0f;
         if(y < -1.0f) y = -1.0f;
         g_wb.y2[i]=y;
@@ -458,7 +470,7 @@ static void demod_block(const float *iq, size_t nsamp, double fs_in){
     if(n2) push_audio(g_wb.y2, n2);
 
     if(atomic_load(&g_debug)){
-        static unsigned dbg=0; if(++dbg % 10 == 0){
+        if(++dsp_dbg_ctr % 10 == 0){
             double rms=0; for(size_t ii=0;ii<n2;ii++){ double v=g_wb.y2[ii]; rms+=v*v; }
             rms = n2? sqrt(rms/n2) : 0.0;
             uint64_t aw = g_ring.hdr? atomic_load(&g_ring.hdr->wpos):0;
@@ -556,6 +568,7 @@ static void wfmd_publish_memfd(int fd){
         enc,
         fs,
         ch);
+    if(n <= 0 || (size_t)n >= sizeof js) return;
     int fds[1] = { g_ring.memfd };
     send_frame_json_with_fds(fd, js, (size_t)n, fds, 1);
 }
@@ -682,7 +695,7 @@ static void wfmd_free_runtime(void){
     iq_ring_close(&g_iq);
     pthread_mutex_unlock(&g_iq_mu);
     ring_close(&g_ring);
-    cfirdec_free(&rf_ch); firdec_free(&a1); firdec_free(&a2);
+    demod_state_reset();   /* zeroes DSP IIR/feedback state so restart is clean */
     free(g_wb.bb); free(g_wb.dphi); free(g_wb.y1); free(g_wb.y2); free(g_wb.tmp_f); free(g_wb.iq_raw);
     memset(&g_wb, 0, sizeof(g_wb));
 }
@@ -716,7 +729,7 @@ static void *ctrl_run(void *arg){
     ph_create_feed(fd, "wfmd.audio-info");
 
     const double audio_fs = 48000.0;
-    const size_t audio_sec = 2;
+    const size_t audio_sec = 8; /* was 2; more headroom prevents overrun from brief rate spikes */
     const size_t ring_bytes = (size_t)(audio_fs * audio_sec * sizeof(float));
     ring_close(&g_ring);
     if(ring_open(&g_ring, ring_bytes, audio_fs)==0) wfmd_publish_memfd(fd);

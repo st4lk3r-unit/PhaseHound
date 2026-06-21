@@ -15,6 +15,11 @@ void ph_dsp_nco_f32_init(ph_dsp_nco_f32_t *nco, double fs_hz, double freq_hz, do
 void ph_dsp_nco_f32_set_freq(ph_dsp_nco_f32_t *nco, double fs_hz, double freq_hz);
 void ph_dsp_nco_f32_next(ph_dsp_nco_f32_t *nco, float *c, float *s);
 
+/* In-place radix-2 DIT complex FFT.
+   buf: interleaved CF32 [re,im,...], N elements, N must be a power of 2.
+   inverse: 0 = forward DFT, non-zero = inverse DFT (not normalised). */
+void ph_fft_cf32(float *buf, int N, int inverse);
+
 #ifdef __cplusplus
 }
 #endif

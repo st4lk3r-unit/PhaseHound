@@ -67,7 +67,13 @@ static void *play_thread(void *arg){
         unsigned ch = S.hdr->channels ? S.hdr->channels : 1u;
         size_t max_frames = (sizeof(framebuf)/sizeof(framebuf[0])) / ch;
         size_t nframes = au_ring_pop_f32(&S, framebuf, max_frames);
-        if(nframes == 0){ S.underrun_events++; ph_msleep(1); continue; }
+        if(nframes == 0){
+            S.underrun_events++;
+            /* Feed silence to ALSA rather than sleeping; prevents XRUN when the
+             * audio ring stalls briefly (e.g., during wfmd DSP batch or USB gap). */
+            memset(framebuf, 0, max_frames * ch * sizeof(float));
+            nframes = max_frames;
+        }
 
         snd_pcm_sframes_t wrote = snd_pcm_writei(S.pcm, framebuf, nframes);
         if(wrote < 0){

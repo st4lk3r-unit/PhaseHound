@@ -13,11 +13,12 @@ Optional addon dependencies:
 
 - `pkg-config SoapySDR` for `soapy`
 - `pkg-config alsa` for `audiosink`
+- `pkg-config glfw3` + `libGL` for `ph-waterfall`
 
 Ubuntu/Debian example:
 
 ```bash
-sudo apt install build-essential pkg-config libsoapysdr-dev libasound2-dev
+sudo apt install build-essential pkg-config libsoapysdr-dev libasound2-dev libglfw3-dev
 ```
 
 ## Build all
@@ -27,6 +28,12 @@ make -j"$(nproc)"
 ```
 
 The default `all` target builds `ph-core`, `ph-cli`, and every addon directory containing a Makefile. A missing optional backend causes that addon to be skipped; actual compiler/linker failures still fail the build.
+
+Build the optional waterfall viewer (requires GLFW 3 and libGL):
+
+```bash
+make waterfall
+```
 
 Require optional dependencies, as release CI does:
 
@@ -40,7 +47,7 @@ Build only addons:
 make addons -j"$(nproc)"
 ```
 
-Clean all generated objects, binaries, and addon shared objects:
+Clean all generated objects, binaries, and addon shared objects (including `ph-waterfall`):
 
 ```bash
 make clean
@@ -53,6 +60,7 @@ make clean
 ph-core
 ph-cli
 src/addons/*/ph-lib*.so
+ph-waterfall               (optional, built with: make waterfall)
 ```
 
 ## Run and discovery
