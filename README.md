@@ -1,370 +1,339 @@
-# PhaseHound  
-Lightweight modular SDR runtime in pure C
+# PhaseHound
 
+Lightweight, modular SDR runtime in C.
 
-## What is PhaseHound?
-
-PhaseHound is a modular SDR core designed for people who actually care about RF, latency, architecture, and control — not just pretty GUIs.
-
-- **Core daemon (`ph-core`)**  
-  A broker that manages local "feeds", routes messages, and glues modules together. Think lightweight signal bus for SDR.
-
-- **Runtime-loadable add-ons (.so plugins)**  
-  Each add-on can publish IQ streams, demodulate, decode, sink audio, log metadata, etc.  
-  Add-ons register feeds dynamically and talk to the core at runtime.  
-  They can be loaded / unloaded without restarting.
-
-- **CLI (`ph-cli`)**  
-  A tiny control tool that speaks the core protocol over a Unix domain socket. You can:
-  - list addons / feeds  
-  - subscribe to live output  
-  - send commands to addons  
-  - load/unload addons  
-  - inspect IQ/PCM ring announcements  
-
-The goal: a clean SDR processing pipeline that is:
-- headless  
-- scriptable  
-- zero bloat  
-- fast enough for real RF work  
-- **fully dynamic and explicitly wired by the user** through feed subscriptions.
-
-
-
-## Why does this exist?
-
-Most SDR stacks fall into 2 buckets:
-
-1. Giant GUI labs (heavy, slow, not deployable).  
-2. Hardcoded demod chains that can't be composed.
-
-PhaseHound is a middle layer:
-
-- It's not a GUI.  
-- It's not a monolithic demod.  
-- It's a **signal routing runtime** that lets you wire:
-
-```
-
-RF source → DSP stages → decoders → sinks
-
-````
-
-…using dynamically loaded plugins.
-
-Example pipeline:
-
-- SoapySDR RF source (`soapy`)  
-- Wide FM demodulator (`wfmd`)  
-- Audio sink (`audiosink`)  
-- Monitoring via CLI  
-- All talking via **shared-memory rings** + control feeds.
-
-You extend it by dropping `.so` files — no rebuilding the core.
-
-
-
-## High-level architecture
+PhaseHound is a local broker and plugin runtime for building explicit SDR pipelines without a monolithic GUI or a hard-coded signal chain. The core handles control-plane routing; high-rate IQ and audio remain in shared-memory rings passed between addons with `SCM_RIGHTS`.
 
 ```text
-                +----------------------+
-                |      ph-cli          |
-                | (control / monitor)  |
-                +----------------------+
-                           |
-                           |  Unix Domain Socket
-                           v
-                  +------------------+
-                  |     ph-core      |
-                  |  (the broker)    |
-                  +------------------+
-                            |
-            +-----------------------------------+
-            |                                   |
-    +--------------+                    +---------------+
-    |   soapy.so   |                    |   wfmd.so     |
-    | RF source    |                    | WFM demod     |
-    | (IQ ring)    |                    | (PCM ring)    |
-    +--------------+                    +---------------+
-            |                                   |
-            |   shared memory buffers (SHM FD)  |
-            |   attached over UDS via           |
-            |   SCM_RIGHTS                      |
-            v                                   v
-        +------------------+           +-----------------+
-        | soapy.IQ-info    |           | wfmd.audio-info |
-        +------------------+           +-----------------+
-                                                |
-                                                v
-                                      +------------------+
-                                      | audiosink.so     |
-                                      | audio playback   |
-                                      +------------------+
-````
+RF/file source -> DSP or decoder -> audio/file/event sink
+                       ^
+                       |
+                 explicit wiring
+```
 
-There are 3 important concepts:
+## Current capabilities
 
-### 1. Feeds
+- C11 core daemon (`ph-core`) with Unix-domain-socket pub/sub.
+- Runtime addon discovery, loading, unloading, and capability reporting.
+- CLI (`ph-cli`) for feed inspection, control, and live monitoring.
+- IQ and audio SHM rings with local per-consumer cursors.
+- Reserved-header telemetry and normalized timestamps.
+- SoapySDR IQ source with hardware timestamps when available.
+- Wide-FM demodulator with a separate control and DSP thread.
+- LoRa CSS preamble detector and raw symbol demodulator (`lorad`), with hex file output.
+- ALSA audio sink.
+- Raw/`phcap` file replay and raw/`phcap`/WAV capture.
+- Simultaneous IQ and demodulated-audio capture with independent cursors.
+- OpenGL 3.3 real-time waterfall + spectrum viewer (`ph-waterfall`).
+- Shared DSP primitives under `src/dsp/`.
 
-A feed is a named channel in the broker.
-Add-ons **publish** to feeds or **subscribe** to them.
+The broker never carries continuous sample payloads through JSON. JSON and UDS are used for control and ring announcements; samples remain in SHM.
+
+## Architecture
+
+```text
+                         +----------------+
+                         |     ph-cli     |
+                         +--------+-------+
+                                  |
+                         UDS control plane
+                                  |
+                         +--------v-------+
+                         |     ph-core    |
+                         | feed broker +  |
+                         | addon loader   |
+                         +---+---------+--+
+                             |         |
+                 SHM + memfd |         | SHM + memfd
+                             |         |
+                     +-------v--+   +--v---------+
+                     |  soapy   |   | filesource |
+                     | IQ source|   | IQ/audio   |
+                     +-----+----+   +-----+------+
+                           |              |
+                           +------IQ------+
+                                  |
+                            +-----v-----+
+                            |   wfmd    |
+                            | WFM -> PCM|
+                            +-----+-----+
+                                  |
+                           +------+-------+
+                           |              |
+                     +-----v------+ +-----v----+
+                     | audiosink  | | filesink |
+                     | ALSA output| | capture  |
+                     +------------+ +----------+
+```
+
+Addons use usage-tagged routing:
+
+```text
+subscribe <usage> <feed>
+unsubscribe <usage>
+```
 
 Examples:
 
-* `soapy.config.in/out`
-* `wfmd.audio-info`
-* `soapy.IQ-info`
-* `dummy.foo` (custom)
-
-### 2. Messages
-
-Messages are JSON frames over UDS.
-They may include file descriptors when announcing shared-memory buffers.
-
-### 3. Add-ons
-
-Add-ons are `.so` files implementing:
-
-* feed registration
-* command parsing
-* publish/subscribe
-* SHM ring creation and consumption
-* DSP / decode loops
-
-Add-ons are totally decoupled; wiring is **explicit** and chosen by the user.
-
-## Features (current status)
-
-* Pure C11 / `pthread` / `dlopen`
-* UDS-based pub/sub broker
-* Dynamic addon discovery and hot loading
-* Zero-copy shared memory ring buffers (IQ + PCM)
-* File descriptors passed with `SCM_RIGHTS`
-* SoapySDR add-on for live RF capture
-* Wide FM demod add-on
-* Audio sink add-on (ALSA)
-* Dummy add-on for authors
-* Minimal CLI
-* **New normalized ABI with usage-tagged routing:**
-
-  ```
-  subscribe <usage> <feed>
-  unsubscribe <usage>
-  ```
-
-  Examples:
-
-  * `subscribe iq-source soapy.IQ-info`
-  * `subscribe pcm-source wfmd.audio-info`
-
-Status: IQ → WFM → audio pipeline fully functional.
-ABI stabilizing.
-SHM rings normalized across addons.
-
-## Quick start (FM radio demo)
-
-This is the “real RF” demo.
-
-### 0. Build
-
-```bash
-cd PhaseHound/
-make
+```text
+subscribe iq-source soapy.IQ-info
+subscribe pcm-source wfmd.audio-info
 ```
 
-### 1. Run the core
+## Build
+
+Required:
+
+- Linux or another POSIX environment with C11, `make`, `pthread`, and `dlopen`.
+- Linux is recommended for `memfd_create`; the SHM helper has a POSIX fallback.
+
+Optional addon dependencies:
+
+- SoapySDR development files for `soapy`.
+- ALSA development files for `audiosink`.
+- GLFW 3 + libGL development files for the `ph-waterfall` viewer.
+
+On Ubuntu/Debian:
+
+```bash
+sudo apt install build-essential pkg-config libsoapysdr-dev libasound2-dev libglfw3-dev
+make -j"$(nproc)"          # builds core, CLI, all addons, and ph-waterfall if GLFW is present
+```
+
+The top-level `make` builds the core, CLI, and every bundled addon. Optional addons are skipped when their development package is absent. Use this in CI or release builds to require all optional backends:
+
+```bash
+make REQUIRE_DEPS=1 -j"$(nproc)"
+```
+
+Main artifacts:
+
+```text
+ph-core
+ph-cli
+src/addons/*/ph-lib*.so
+ph-waterfall               (optional, built with: make waterfall)
+```
+
+## Run
+
+Start the core from the repository root so its default discovery paths can find built addons:
 
 ```bash
 ./ph-core
 ```
 
-Example output:
+The default control socket is:
 
 ```text
-[INF] core listening on /tmp/phasehound-broker.sock
-[INF] loaded plugin soapy
-[INF] loaded plugin wfmd
-[INF] loaded plugin audiosink
+/tmp/.PhaseHound-broker.sock
 ```
 
-### 2. Inspect feeds
+The core automatically scans `./src/addons`, `./addons`, and the current directory for shared objects. Verify what is available and loaded:
 
 ```bash
-./ph-cli list feeds
+./ph-cli available-addons
 ./ph-cli list addons
+./ph-cli list feeds
 ```
 
-### 3. Tune the SDR source
-
-Example: FM broadcast at 100 MHz, 2.4 MS/s:
+Manual loading and unloading remain available:
 
 ```bash
-./ph-cli pub soapy.config.in \
-"set sr=2400000 cf=100.0e6 bw=1.5e6"
+./ph-cli load addon wfmd
+./ph-cli unload addon wfmd
+```
+
+## Live WFM pipeline
+
+The order matters because ring descriptors are delivered to current subscribers. Late consumers can request a republish with `open`.
+
+First, monitor control and ring-announcement feeds in a separate terminal:
+
+```bash
+./ph-cli sub \
+  soapy.config.out soapy.IQ-info \
+  wfmd.config.out wfmd.audio-info \
+  audiosink.config.out
+```
+
+Configure the SDR, then wire consumers before starting producers:
+
+```bash
+# Select and configure hardware.
 ./ph-cli pub soapy.config.in "select 0"
-./ph-cli pub soapy.config.in "start"
-```
+./ph-cli pub soapy.config.in "set sr=2400000 cf=100.0e6 bw=1.5e6"
 
-This allocates an **IQ SHM ring** and announces it on:
-
-```
-soapy.IQ-info
-```
-
-### 4. Wire the pipeline
-
-#### WFMD subscribes to IQ:
-
-```bash
+# Wire IQ and PCM routes before descriptors are published.
 ./ph-cli pub wfmd.config.in "subscribe iq-source soapy.IQ-info"
-./ph-cli pub soapy.config.in "open"     # republish memfd for newcomers
-```
-
-#### WFMD publishes its audio ring:
-
-```bash
-./ph-cli pub wfmd.config.in "open"
-```
-
-#### audiosink subscribes to PCM:
-
-```bash
 ./ph-cli pub audiosink.config.in "subscribe pcm-source wfmd.audio-info"
-```
 
-#### Start DSP + playback:
+# Publish the audio ring, then create/publish the IQ ring.
+./ph-cli pub wfmd.config.in "open"
+./ph-cli pub soapy.config.in "start"
 
-```bash
+# Start processing and playback.
+./ph-cli pub wfmd.config.in "gain 0.5"
+./ph-cli pub wfmd.config.in "bw 110000"   # 110 kHz fits within 240 kHz Nyquist of the channel
 ./ph-cli pub wfmd.config.in "start"
 ./ph-cli pub audiosink.config.in "start"
 ```
 
-You should now hear FM audio.
-
-## Quick start (developer/dummy demo)
-
-Load the dummy addon:
+To attach a consumer after streaming has already started:
 
 ```bash
-./ph-cli load addon dummy
+./ph-cli pub soapy.config.in "open"
+./ph-cli pub wfmd.config.in "open"
 ```
 
-Help:
+The convenience script runs the same live pipeline, captures IQ plus audio, and launches
+the waterfall viewer automatically if `ph-waterfall` is present in the working directory:
 
 ```bash
-./ph-cli pub dummy.config.in "help"
+DURATION=30 CF=100.0e6 ./wfmd-96-audiosink.sh
 ```
 
-Subscribe to its outputs:
+Default outputs are a `phcap` IQ file and a WAV audio file under `captures/`.
+
+## Waterfall viewer
+
+`ph-waterfall` renders a scrolling power-spectrum waterfall and a live spectrum pane
+(power vs. frequency) via OpenGL 3.3.  It connects to ph-core and subscribes to any
+IQ ring feed.
 
 ```bash
-./ph-cli sub dummy.config.out
-./ph-cli sub dummy.foo
+./ph-waterfall --feed soapy.IQ-info
+./ph-waterfall --feed filesource.IQ-info --fft 4096 --rows 4096
 ```
 
-Demo SHM feed:
+Keys:
+
+| Key | Action |
+|-----|--------|
+| `A` | Auto-set colour range from live signal percentiles |
+| `+` / `-` | Raise / lower upper dB limit by 5 |
+| `[` / `]` | Lower / raise lower dB limit by 5 |
+| `Q` / Esc | Quit |
+
+The window title updates ~10 Hz with the frequency and power level under the cursor.
+The convenience scripts launch the viewer automatically when the binary is present.
+
+## LoRa demodulator
+
+`lorad` is a LoRa CSS preamble detector and raw symbol demodulator. It consumes an IQ ring,
+channelizes and dechirps the signal, detects preambles (8 upchirps), skips the SFD, and
+Gray-decodes data symbols into raw byte packets. No FEC or de-interleaving.
 
 ```bash
-./ph-cli pub dummy.config.in "shm-demo"
+# Wire IQ source (tune SDR to LoRa channel centre first)
+./ph-cli pub lorad.config.in "subscribe iq-source soapy.IQ-info"
+
+# LoRa parameters (SF7, 125 kHz is a common default)
+./ph-cli pub lorad.config.in "sf 7"
+./ph-cli pub lorad.config.in "bw 125000"
+./ph-cli pub lorad.config.in "foff 0"       # Hz offset within the IQ band if needed
+
+# Write decoded packets as hex lines to a file (one packet per line)
+./ph-cli pub lorad.config.in "output-path /tmp/lora-frames.hex"
+
+# Start demodulating
+./ph-cli pub lorad.config.in "start"
+
+# Monitor packets live on the control plane simultaneously
+./ph-cli sub lorad.packets
 ```
 
-Dummy illustrates:
-
-* config feeds
-* arbitrary feeds
-* usage-tagged subscription
-* SHM creation
-* JSON replies
-
-## ph-cli cheatsheet
+Close the output file without stopping:
 
 ```bash
-./ph-cli list addons
+./ph-cli pub lorad.config.in "output-close"
+```
+
+Append to an existing file instead of overwriting:
+
+```bash
+./ph-cli pub lorad.config.in "output-append 1"
+./ph-cli pub lorad.config.in "output-path /tmp/lora-frames.hex"
+```
+
+## File replay and capture
+
+`filesink` can capture IQ and audio simultaneously:
+
+```bash
+./ph-cli pub filesink.config.in "format phcap"
+./ph-cli pub filesink.config.in "audio-format wav"
+./ph-cli pub filesink.config.in "iq-path /tmp/live-iq.phcap"
+./ph-cli pub filesink.config.in "audio-path /tmp/live-audio.wav"
+./ph-cli pub filesink.config.in "subscribe iq-source soapy.IQ-info"
+./ph-cli pub filesink.config.in "subscribe pcm-source wfmd.audio-info"
+./ph-cli pub filesink.config.in "start"
+```
+
+Replay an IQ capture through WFMD without SDR hardware:
+
+```bash
+./wfmd-iqfile-to-audio.sh /tmp/live-iq.phcap /tmp/demod-audio.wav
+```
+
+For raw input, provide its metadata:
+
+```bash
+TYPE=iq-cf32 SR=2400000 CF=100.0e6 \
+  ./wfmd-iqfile-to-audio.sh /tmp/capture.cf32 /tmp/demod-audio.wav
+```
+
+See [`docs/FILE_IO.md`](docs/FILE_IO.md) for formats, metadata, replay pacing, and all commands.
+
+## CLI summary
+
+```bash
+./ph-cli help
 ./ph-cli list feeds
-./ph-cli load addon <name>
+./ph-cli list addons
+./ph-cli available-addons
+./ph-cli load addon <name|path>
 ./ph-cli unload addon <name>
-
-# publish a control command
 ./ph-cli pub <feed> "<text>"
-
-# subscribe to feed(s)
-./ph-cli sub <feedA> [<feedB> ...]
+./ph-cli sub <feed> [feed2 ...]
 ```
 
-You can subscribe to multiple feeds simultaneously, very useful for watching data flow live.
+`ph-cli pub` waits for a broker dispatch acknowledgement, so sequential CLI commands are delivered to each subscriber socket in order. This acknowledgement does not mean the addon accepted the command: addon replies, validation errors, and status are published on `<addon>.config.out`.
 
-## How add-ons talk to each other
+## Documentation
 
-### Control plane
+- [`docs/README.md`](docs/README.md) — documentation index.
+- [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — core, feeds, plugins, and data plane.
+- [`docs/CLI.md`](docs/CLI.md) — CLI behavior and routing examples.
+- [`docs/REALTIME.md`](docs/REALTIME.md) — cursors, timestamps, and telemetry.
+- [`docs/FILE_IO.md`](docs/FILE_IO.md) — capture/replay formats and commands.
+- [`docs/ADDON_DEVELOPMENT.md`](docs/ADDON_DEVELOPMENT.md) — addon ABI and implementation patterns.
+- [`docs/TROUBLESHOOTING.md`](docs/TROUBLESHOOTING.md) — common failures.
 
-* JSON messages over UDS
-* Typically on `<addon>.config.in/out`
-* Human-readable debugging
+## Status and next steps
 
-### Data plane (high rate)
+Implemented now:
 
-* File descriptors sent over UDS using `SCM_RIGHTS`
-* IQ and PCM streams are **shared memory ring buffers**
-* Add-ons use atomic cursors for lock-free streaming
-* Zero copies, stable performance
+- core broker, CLI, addon autoload/hot-load,
+- normalized usage-tagged routing,
+- IQ/audio SHM rings with multi-consumer cursors,
+- live Soapy -> WFMD -> ALSA pipeline,
+- LoRa CSS demod with hex file output,
+- file source/sink, dual capture, WAV output, and `phcap` replay,
+- timestamp propagation and real-time status counters,
+- ordered broker dispatch acknowledgements and partial-I/O-safe framed transport,
+- OpenGL 3.3 waterfall + spectrum viewer with auto-gain and cursor readout,
+- GitHub Actions release build.
 
-This avoids the classic “push samples through JSON/Python” problem.
+Still evolving:
 
-## Dependencies
-
-**Required**
-
-* Linux / POSIX
-* gcc/clang
-* pthread
-* dlopen
-
-**Optional**
-
-* SoapySDR (for hardware RF)
-
-Without SoapySDR, everything still builds — only hardware input is missing.
-
-## Project status / roadmap
-
-* ✅ Core broker
-* ✅ Pub/sub model
-* ✅ CLI
-* ✅ SHM ring buffers
-* ✅ SoapySDR source
-* ✅ WFM demod
-* ✅ Audio sink
-* ✅ Dummy
-* 🔄 ABI normalization (feeds + SHM + usage-tagged routing)
-* 🔄 Documentation unification
-* 🔲 Digital voice (DMR, TETRA, P25…)
-* 🔲 File/network IQ sources
-* 🔲 Remote access over TCP
-* 🔲 CI + sanitizers + fuzzers
-
-Long-term vision:
-
-* PhaseHound becomes the “radio daemon” you leave running
-* You control it via CLI or a lightweight UI
-* DSP/decoders shipped as modular plugins
-* Serious RF signal chains built without monolithic SDR apps
+- sidecar per-block ring metadata,
+- eventfd/futex wakeups instead of short starvation sleeps,
+- multi-device clock/PPS session management,
+- a broader shared DSP library,
+- network IQ transport,
+- stable cross-platform `phcap` interchange rules.
 
 ## Contributing
 
-Contributions welcome:
-
-* new demods
-* new sinks
-* protocol decoders
-* SHM optimizations
-* broker improvements
-* bugfixes / docs updates
-
-Code stays clean C11 — no magic, no bloated frameworks.
-
-Open an issue or PR if:
-
-* docs or ABI drift
-* protocol needs clarity
-* you wrote a cool addon
-
+Contributions are welcome for demodulators, decoders, sources, sinks, DSP primitives, broker improvements and documentation. Keep hot paths in clean C11, keep control messages small, and use SHM for sustained payloads.

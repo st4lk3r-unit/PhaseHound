@@ -2,26 +2,85 @@
 
 ## Prerequisites
 
-- POSIX toolchain (C11 compiler, make)
-- Linux recommended (for `memfd_create`); works with POSIX SHM fallback
-- `dlopen`/`pthread` available
+Required:
+
+- C11 compiler and `make`
+- POSIX threads and `dlopen`
+- Linux recommended for `memfd_create`; the helper can fall back to POSIX SHM
+- Python 3 for replay-duration estimation in the offline helper script
+
+Optional addon dependencies:
+
+- `pkg-config SoapySDR` for `soapy`
+- `pkg-config alsa` for `audiosink`
+- `pkg-config glfw3` + `libGL` for `ph-waterfall`
+
+Ubuntu/Debian example:
+
+```bash
+sudo apt install build-essential pkg-config libsoapysdr-dev libasound2-dev libglfw3-dev
+```
 
 ## Build all
 
 ```bash
-make            # builds ph-core and ph-cli
-make addons     # builds all add-ons under src/addons/*
+make -j"$(nproc)"
 ```
 
-Artifacts:
-- `ph-core`
-- `ph-cli`
-- `src/addons/*/lib*.so`
+The default `all` target builds `ph-core`, `ph-cli`, and every addon directory containing a Makefile. A missing optional backend causes that addon to be skipped; actual compiler/linker failures still fail the build.
 
-## Run
+The waterfall viewer (`ph-waterfall`) is built automatically by `make` when `libglfw3-dev` is detected. To build it explicitly or in isolation:
+
+```bash
+make waterfall
+```
+
+Require optional dependencies, as release CI does:
+
+```bash
+make REQUIRE_DEPS=1 -j"$(nproc)"
+```
+
+Build only addons:
+
+```bash
+make addons -j"$(nproc)"
+```
+
+Clean all generated objects, binaries, and addon shared objects (including `ph-waterfall`):
+
+```bash
+make clean
+```
+
+
+## Artifacts
+
+```text
+ph-core
+ph-cli
+src/addons/*/ph-lib*.so
+ph-waterfall               (optional, built with: make waterfall)
+```
+
+## Run and discovery
+
+Run from the repository root:
 
 ```bash
 ./ph-core
 ```
 
-Use a second terminal for `./ph-cli ...` commands.
+The core scans these relative locations at startup:
+
+```text
+./src/addons
+./addons
+./
+```
+
+Running elsewhere requires manually loading readable shared-object paths with `ph-cli load addon /path/to/ph-libname.so`.
+
+## Install target
+
+The current `make install` target installs only `ph-core` and `ph-cli` into `$(PREFIX)/bin` (default `/usr/local/bin`). Addon installation and a system-wide addon search path are not implemented yet; release bundles include an `addons/` directory instead.

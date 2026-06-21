@@ -1,146 +1,143 @@
-# Developing PhaseHound Addons
+# Developing PhaseHound addons
 
-This document describes how to implement a normalized PhaseHound addon (.so).
+A PhaseHound addon is a shared object implementing the normalized plugin ABI and, normally, its own control connection to the broker.
 
----
+## Plugin ABI
 
-## 1. Plugin ABI
-
-Each addon exports:
+Export exactly these symbols:
 
 ```c
-const char* plugin_name(void);
-
+const char *plugin_name(void);
 bool plugin_init(const plugin_ctx_t *ctx, plugin_caps_t *caps);
 bool plugin_start(void);
 void plugin_stop(void);
-````
+```
 
-`plugin_name()` returns the short logical addon name (e.g. `"wfmd"`).  
-Inside `plugin_init()` you should call `PH_ENSURE_ABI(ctx);` at the top to
-verify `PLUGIN_ABI_MAJOR` / `PLUGIN_ABI_MINOR` before using `ctx->sock_path`.
-
-
-### 1.1 `plugin_caps_t`
-
-Declares only **static** feeds:
-
-* `<name>.config.in`
-* `<name>.config.out`
-* other permanent feeds (`*.IQ-info`, `*.audio-info`, `*.foo`)
-
-Example:
+At the beginning of `plugin_init()`:
 
 ```c
-static const char *CONS[] = { "wfmd.config.in", NULL };
-static const char *PROD[] = { "wfmd.config.out", "wfmd.audio-info", NULL };
+PH_ENSURE_ABI(ctx);
+```
 
+Populate the complete capability structure, including `caps_size`:
+
+```c
+static const char *CONS[] = { "example.config.in", NULL };
+static const char *PROD[] = { "example.config.out", "example.data-info", NULL };
+
+caps->caps_size = sizeof *caps;
+caps->name = "example";
+caps->version = "0.1.0";
 caps->consumes = CONS;
 caps->produces = PROD;
+caps->feat_bits = PH_FEAT_IQ;
 ```
 
-Dynamic data-feed bindings are done via `subscribe <usage> <feed>`.
+Capability lists describe static feeds. Runtime-selected data sources belong in usage-tagged subscriptions rather than hard-coded capability entries.
 
----
+## Control connection
 
-## 2. Control Plane
+The shared control helper establishes the connection, advertises `<name>.config.in/out`, and subscribes to the input feed:
 
-Addons receive text commands on `*.config.in`.
-
-All parsing is free-form, conventionally:
-
+```c
+ph_ctrl_t ctrl;
+int fd = ph_connect_ctrl(&ctrl, "example", ctx->sock_path, 50, 100);
 ```
+
+Dispatch incoming control frames with:
+
+```c
+ph_ctrl_dispatch(&ctrl, json, json_len, on_cmd, user);
+```
+
+The dispatcher accepts both `command` and `publish` frames addressed to the addon's config input.
+
+Common commands:
+
+```text
 help
+status
+open
 start
 stop
 subscribe <usage> <feed>
 unsubscribe <usage>
-open
 ```
 
-Usage-tagged routing pattern:
+Use `ph_handle_subscribe_cmd()` and `ph_handle_unsubscribe_cmd()` where possible so routing semantics remain consistent.
+
+## Ring producers
+
+Create rings through `ph_ring.h`:
 
 ```c
-if(strncmp(cmd, "subscribe ", 10) == 0) {
-    char usage[32], feed[128];
-    sscanf(cmd+10, "%31s %127s", usage, feed);
-    // unsubscribe previous usage slot if any, then subscribe new
-}
+int memfd = -1;
+phiq_hdr_t *iq = NULL;
+size_t map_bytes = 0;
+
+ph_iq_ring_create("example-iq", sample_rate, 1, PHIQ_FMT_CF32,
+                  capacity_bytes, &memfd, &iq, &map_bytes);
 ```
 
----
-
-## 3. Data Plane (SHM Rings)
-
-Addons exchange bulk data via shared-memory rings.
-
-Producers announce rings via a meta message:
-
-```json
-{
-  "type":"publish",
-  "feed":"soapy.IQ-info",
-  "subtype":"shm_map",
-  "proto":"phasehound.iq-ring.v0",
-  "version":"0.1",
-  "size":1048576,
-  "desc":"IQ ring",
-  "mode":"r"
-}
-```
-
-Consumers receive a single memfd and map it into their address space,
-then interpret the header as `phiq_hdr_t` (for IQ) or `phau_hdr_t` (for audio)
-from `ph_stream.h`. A minimal IQ consumer looks like:
+Write complete frames with the producer helper:
 
 ```c
-struct stat st;
-if (fstat(memfd, &st) == 0 && st.st_size > (off_t)sizeof(phiq_hdr_t)) {
-    void *base = mmap(NULL, (size_t)st.st_size,
-                      PROT_READ|PROT_WRITE, MAP_SHARED,
-                      memfd, 0);
-    if (base && base != MAP_FAILED) {
-        phiq_hdr_t *hdr = (phiq_hdr_t *)base;
-        /* consume hdr->data using hdr->rpos / hdr->wpos */
-    }
-}
+ph_timestamp_v0_t ts = ph_timestamp_from_clock(
+    CLOCK_MONOTONIC, PH_CLOCK_HOST_MONOTONIC, antenna_id,
+    PH_TS_QUALITY_ESTIMATED);
+
+ph_iq_ring_write(iq, payload, payload_bytes, &ts);
 ```
 
-See `src/addons/wfmd/src/wfmd.c` and `src/addons/audiosink/src/audiosink_ring.c`
-for full producer/consumer patterns.
+Announce the ring on a stable info feed and attach the memfd with `send_frame_json_with_fds()`. The broker does not retain announcements, so implement `open` as a descriptor republish operation for late subscribers.
 
+## Ring consumers
 
----
+Never use the shared header `rpos` as the authoritative cursor for a real pipeline. It remains only for v0 ABI compatibility. Each consumer owns a local `ph_ring_consumer_t`:
 
-## 4. Example: Demodulator Addon
+```c
+ph_ring_consumer_t cursor;
+ph_iq_ring_consumer_init_live(&cursor, iq);
 
-1. Provide config feed (`wfmd.config.in/out`)
-2. Accept IQ via:
+uint64_t lost = 0;
+size_t got = ph_iq_ring_consume_copy(iq, &cursor, scratch,
+                                     scratch_bytes, &lost);
+```
 
-   ```
-   subscribe iq-source soapy.IQ-info
-   ```
-3. `open` establishes PCM SHM ring (`wfmd.audio-info`)
-4. `start` spawns DSP thread
+Choose the initial cursor deliberately:
 
----
+- `*_consumer_init_live()` starts at the producer's current write position.
+- `*_consumer_init_oldest()` starts at the oldest bytes still retained in the ring.
 
-## 5. Example: Sink Addon
+The consume helper detects overwrite loss when producer distance exceeds capacity and advances only the local cursor. This is what makes one producer safe for multiple consumers.
 
-1. Provide config feed (`audiosink.config.in/out`)
-2. Accept PCM via:
+## Timestamps and telemetry
 
-   ```
-   subscribe pcm-source wfmd.audio-info
-   ```
-3. `start` maps PCM SHM and plays audio
+The existing 64-byte `reserved[]` region can contain `ph_ring_meta_v0_t` without moving the v0 `data[]` offset. Producers should initialize it and update the latest timestamp/drop/glitch fields through `ph_ring_meta.h` helpers.
 
----
+Current ring metadata is latest-block state. Exact per-block propagation will use a future sidecar metadata ring rather than changing the v0 sample header.
 
-## 6. Summary
+## Threading
 
-* Static feeds: declared in `plugin_caps`
-* Dynamic wiring: always via `subscribe <usage> <feed>`
-* SHM rings: announced by producers with `shm_map`
-* No addon should auto-connect to another
+Keep blocking control I/O away from sustained DSP or device loops. The reference pattern is:
 
+```text
+control thread: commands, subscriptions, descriptor mapping
+data thread:    device/file read, DSP, ring write/read
+```
+
+Use atomics for small runtime controls and a mutex for mapping or device lifetime transitions. `plugin_stop()` must stop workers, join every joinable thread, unmap rings, close fds, and release backend resources before returning because the core may immediately `dlclose()` the addon.
+
+## Build
+
+Bundled addons produce `ph-lib<name>.so` and include public headers from `../../../include`.
+
+A release build should link with unresolved-symbol checking where practical (`-Wl,-z,defs`) and must fail on real compiler/linker errors. Optional hardware backends may skip only when their external development package is absent.
+
+## References
+
+- `src/addons/dummy/` — control and generic SHM example.
+- `src/addons/filesource/` — producer and replay lifecycle.
+- `src/addons/wfmd/` — IQ consumer plus audio producer.
+- `src/addons/filesink/` — dual independent consumers.
+- `docs/SHM_GUIDE.md` and `docs/REALTIME.md` — cursor and metadata rules.

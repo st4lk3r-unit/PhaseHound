@@ -1,10 +1,10 @@
 #include "audiosink.h"
-#include <alloca.h>  
+#include <alloca.h>
 #include <stdio.h>
 
 void au_pcm_close(audiosink_t *s){
     if(s->pcm){
-        snd_pcm_drain(s->pcm);
+        snd_pcm_drop(s->pcm);
         snd_pcm_close(s->pcm);
         s->pcm = NULL;
     }
@@ -34,7 +34,7 @@ int au_pcm_open(audiosink_t *s, unsigned rate, unsigned ch){
 
     snd_pcm_uframes_t period = 480;  /* ~10 ms @ 48k */
     snd_pcm_hw_params_set_period_size_near(pcm, hw, &period, 0);
-    snd_pcm_uframes_t bufsize = period * 4;
+    snd_pcm_uframes_t bufsize = period * 20; /* ~200 ms; large buffer prevents XRUN during brief ring starvation */
     snd_pcm_hw_params_set_buffer_size_near(pcm, hw, &bufsize);
 
     rc = snd_pcm_hw_params(pcm, hw);

@@ -11,12 +11,13 @@
 #include <signal.h>
 #include <pthread.h>
 #include <dlfcn.h>
-#include <sys/select.h>
+#include <sys/epoll.h>
 #include <dirent.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <sys/un.h>
+#include <execinfo.h>
 
 #include "ph_version.h"
 #ifndef PH_GIT_SHA
@@ -68,7 +69,12 @@ static int plugtab_find(plugtab_t *t, const char *name){
     return -1;
 }
 static void plugtab_add(plugtab_t *t, plug_t p){
-    if(t->n==t->cap){ size_t nc=t->cap? t->cap*2:4; t->v=realloc(t->v,nc*sizeof(plug_t)); t->cap=nc; }
+    if(t->n==t->cap){
+        size_t nc=t->cap? t->cap*2:4;
+        plug_t *nv = realloc(t->v, nc*sizeof(plug_t));
+        if(!nv){ log_msg(LOG_ERROR, "plugtab_add: OOM — plugin not registered"); return; }
+        t->v=nv; t->cap=nc;
+    }
     t->v[t->n++] = p;
 }
 static void plugtab_remove(plugtab_t *t, size_t idx){
@@ -78,29 +84,65 @@ static void plugtab_remove(plugtab_t *t, size_t idx){
 
 /* ========= Global state ========= */
 
-static volatile int g_run = 1;
+static volatile sig_atomic_t g_run = 1;
 static void on_sigint(int s){ (void)s; g_run = 0; }
+
+static void crash_handler(int sig) {
+    void *bt[64];
+    int n = backtrace(bt, 64);
+    char **syms = backtrace_symbols(bt, n);
+    dprintf(STDERR_FILENO, "\n[ph-core] FATAL signal %d — backtrace:\n", sig);
+    for (int i = 0; i < n; i++)
+        dprintf(STDERR_FILENO, "  %s\n", syms ? syms[i] : "?");
+    free(syms);
+    signal(sig, SIG_DFL);
+    raise(sig);
+}
 
 static feedtab_t g_feeds;
 static plugtab_t g_plugins;
 static int g_listen_fd = -1;
+static int g_client_count = 0;
+#define PH_MAX_CLIENTS 512
 
 /* ========= Feeds ========= */
 
+/* RT pipeline can have many consumers on a feed (TDOA array elements, etc.) */
+#define PH_MAX_SNAP_SUBS 1024
+
 static void broadcast_to_subs(const char *feed, const char *json, size_t len, int *fds, size_t nfds){
-    int idx = feedtab_find(&g_feeds, feed);
-    if(idx<0) return;
+    /* Snapshot subscriber list under lock, then send outside lock.
+       Prevents a slow subscriber from blocking all others. */
+    int snap[PH_MAX_SNAP_SUBS]; size_t snap_n = 0;
     pthread_mutex_lock(&g_feeds.mu);
-    for(size_t i=0;i<g_feeds.v[idx].subs.n;i++){
-        int fd = g_feeds.v[idx].subs.v[i];
-        if(((nfds>0)? send_frame_json_with_fds(fd, json, len, fds, nfds) : send_frame_json(fd, json, len))<0){
-            /* drop errors silently; cleanup happens on disconnect */
+    for(size_t i = 0; i < g_feeds.n; i++){
+        if(strcmp(g_feeds.v[i].name, feed) == 0){
+            intvec_t *iv = &g_feeds.v[i].subs;
+            if(iv->n > PH_MAX_SNAP_SUBS)
+                log_msg(LOG_WARN, "feed %s: %zu subscribers exceed snapshot cap %d; extras dropped",
+                        feed, iv->n, PH_MAX_SNAP_SUBS);
+            snap_n = iv->n < PH_MAX_SNAP_SUBS ? iv->n : PH_MAX_SNAP_SUBS;
+            for(size_t j = 0; j < snap_n; j++) snap[j] = iv->v[j];
+            break;
         }
     }
     pthread_mutex_unlock(&g_feeds.mu);
+
+    for(size_t i = 0; i < snap_n; i++){
+        if(nfds > 0)
+            send_frame_json_with_fds(snap[i], json, len, fds, nfds);
+        else
+            send_frame_json(snap[i], json, len);
+    }
 }
 
 /* ========= Add-on discovery (autoload) ========= */
+
+/* Match only unversioned .so files — strstr would hit libfoo.so.1.2.3 */
+static int name_ends_with_so(const char *name){
+    size_t n = strlen(name);
+    return n > 3 && strcmp(name + n - 3, ".so") == 0;
+}
 
 static int scan_addon_paths(char paths[][512], int maxn){
     int n=0;
@@ -113,7 +155,7 @@ static int scan_addon_paths(char paths[][512], int maxn){
             if(de->d_name[0]=='.') continue;
             char sub[512];
             int ok = snprintf(sub, sizeof sub, "%s/%s", roots[r], de->d_name);
-            if(ok < 0 || (size_t)ok >= sizeof sub) continue; // trunc guard
+            if(ok < 0 || (size_t)ok >= sizeof sub) continue;
 
             struct stat st; if(stat(sub,&st)<0) continue;
             if(S_ISDIR(st.st_mode)){
@@ -121,17 +163,17 @@ static int scan_addon_paths(char paths[][512], int maxn){
                 struct dirent *de2;
                 while((de2=readdir(d2))){
                     if(de2->d_name[0]=='.') continue;
-                    if(!strstr(de2->d_name,".so")) continue;
+                    if(!name_ends_with_so(de2->d_name)) continue;
                     char so[512];
                     ok = snprintf(so, sizeof so, "%s/%s", sub, de2->d_name);
-                    if(ok < 0 || (size_t)ok >= sizeof so) continue; // trunc guard
+                    if(ok < 0 || (size_t)ok >= sizeof so) continue;
                     if(access(so,R_OK)==0 && n<maxn){
                         path_copy(paths[n++], 512, so);
                     }
                 }
                 closedir(d2);
             } else if(S_ISREG(st.st_mode)){
-                if(strstr(sub,".so") && access(sub,R_OK)==0 && n<maxn){
+                if(name_ends_with_so(de->d_name) && access(sub,R_OK)==0 && n<maxn){
                     path_copy(paths[n++], 512, sub);
                 }
             }
@@ -139,6 +181,33 @@ static int scan_addon_paths(char paths[][512], int maxn){
         closedir(d);
     }
     return n;
+}
+
+
+static int resolve_addon_arg(const char *arg, char out[512]){
+    if(!arg || !out) return -1;
+    out[0] = '\0';
+
+    if(strstr(arg, ".so") && access(arg, R_OK)==0){
+        return path_copy(out, 512, arg);
+    }
+
+    char want1[512], want2[512];
+    int n1 = snprintf(want1, sizeof want1, "ph-lib%s.so", arg);
+    int n2 = snprintf(want2, sizeof want2, "%s.so", arg);
+    if(n1 < 0 || n2 < 0 || (size_t)n1 >= sizeof want1 || (size_t)n2 >= sizeof want2)
+        return -1;
+
+    char paths[128][512];
+    int n = scan_addon_paths(paths, 128);
+    for(int i=0;i<n;i++){
+        const char *base = strrchr(paths[i], '/');
+        base = base ? base + 1 : paths[i];
+        if(strcmp(base, want1)==0 || strcmp(base, want2)==0 || strcmp(base, arg)==0){
+            return path_copy(out, 512, paths[i]);
+        }
+    }
+    return -1;
 }
 
 /* ========= Loader / Unloader (centralized) ========= */
@@ -172,11 +241,7 @@ static int load_plugin_from_path(const char *so_path){
         return 1; /* not an error, just a skip */
     }
 
-    if (path_copy(p.path, sizeof p.path, so_path) != 0) {
-        log_msg(LOG_WARN, "path truncated for %s", p.name);
-        /* still proceed; p.path is empty or truncated */
-        snprintf(p.path, sizeof p.path, "%s", so_path); // best effort, snprintf is fine here
-    }
+    snprintf(p.path, sizeof p.path, "%s", so_path);
 
     /* Build ctx for ABI 1.0 */
     plugin_ctx_t ctx = {
@@ -254,10 +319,26 @@ static void handle_msg(int fd, const char *js, int *fds, size_t nfds){
         char name[POC_MAX_FEED]; if(json_get_string(js,"feed",name,sizeof name)==0) feedtab_sub(&g_feeds, name, fd);
 
     } else if(strcmp(type,"unsubscribe")==0){
-        /* left as exercise */
+        char name[POC_MAX_FEED];
+        if(json_get_string(js,"feed",name,sizeof name)==0)
+            feedtab_unsub(&g_feeds, name, fd);
 
     } else if(strcmp(type,"publish")==0){
-        char name[POC_MAX_FEED]; if(json_get_string(js,"feed",name,sizeof name)==0) broadcast_to_subs(name, js, strlen(js), fds, nfds);
+        char name[POC_MAX_FEED];
+        if(json_get_string(js,"feed",name,sizeof name)==0){
+            broadcast_to_subs(name, js, strlen(js), fds, nfds);
+            /* CLI publishers can request a broker-level dispatch acknowledgement.
+             * It confirms ordered delivery into subscriber sockets, not addon success. */
+            char ack_req[16];
+            if(json_get_string(js,"ack",ack_req,sizeof ack_req)==0 &&
+               (!strcmp(ack_req,"true") || !strcmp(ack_req,"1"))){
+                char feed_esc[POC_MAX_FEED * 2], ack[POC_MAX_JSON];
+                ph_json_escape_string(name, feed_esc, sizeof feed_esc);
+                int n = snprintf(ack,sizeof ack,
+                    "{\"type\":\"ack\",\"op\":\"publish\",\"feed\":\"%s\"}", feed_esc);
+                if(n > 0 && (size_t)n < sizeof ack) (void)send_frame_json(fd,ack,(size_t)n);
+            }
+        }
 
     } else if(strcmp(type,"command")==0){
         char feed[POC_MAX_FEED]; if(json_get_string(js,"feed",feed,sizeof feed)<0) return;
@@ -274,10 +355,12 @@ static void handle_msg(int fd, const char *js, int *fds, size_t nfds){
         } else if(strcmp(cmd,"plugins")==0 || strcmp(cmd,"list addons")==0){
             char buf[POC_MAX_JSON];
             for(size_t i=0;i<g_plugins.n;i++){
+                char ne[128], pe[1024];
+                ph_json_escape_string(g_plugins.v[i].name, ne, sizeof ne);
+                ph_json_escape_string(g_plugins.v[i].path[0]?g_plugins.v[i].path:"", pe, sizeof pe);
                 int len = snprintf(buf, sizeof buf, "{\"type\":\"info\",\"plugin\":\"%s\",\"path\":\"%s\"}",
-                                   g_plugins.v[i].name,
-                                   g_plugins.v[i].path[0]?g_plugins.v[i].path:"");
-                send_frame_json(fd, buf, (size_t)len);
+                                   ne, pe);
+                if(len > 0 && (size_t)len < sizeof buf) send_frame_json(fd, buf, (size_t)len);
             }
 
         } else if(strcmp(cmd,"available-addons")==0){
@@ -286,23 +369,39 @@ static void handle_msg(int fd, const char *js, int *fds, size_t nfds){
             json_send_kv_list(fd, "available-addons", "paths", items, n);
 
         } else if(strncmp(cmd,"load ",5)==0){
-            char arg[256]; strncpy(arg, cmd+5, sizeof arg-1); arg[sizeof arg-1]='\0';
-            /* Require explicit .so path */
-            if(access(arg, R_OK)!=0 || !strstr(arg, ".so")){
-                log_msg(LOG_ERROR, "load: provide a readable .so file path");
+            char arg[256]; snprintf(arg,sizeof arg,"%s",cmd+5);
+            char resolved[512], arg_esc[512];
+            ph_json_escape_string(arg,arg_esc,sizeof arg_esc);
+            if(resolve_addon_arg(arg, resolved)!=0){
+                log_msg(LOG_ERROR, "load: addon '%s' not found; use available-addons or pass a readable .so path", arg);
+                char buf[POC_MAX_JSON];
+                int len = snprintf(buf, sizeof buf, "{\"type\":\"error\",\"msg\":\"addon not found: %s\"}", arg_esc);
+                if(len > 0 && (size_t)len < sizeof buf) send_frame_json(fd, buf, (size_t)len);
             } else {
-                int rc = load_plugin_from_path(arg);
-                if(rc==0){
-                    char buf[POC_MAX_JSON];
-                    int len = snprintf(buf, sizeof buf, "{\"type\":\"info\",\"msg\":\"loaded %s\"}", arg);
-                    send_frame_json(fd, buf, (size_t)len);
-                }
+                int rc = load_plugin_from_path(resolved);
+                char buf[POC_MAX_JSON], resolved_esc[1024];
+                ph_json_escape_string(resolved,resolved_esc,sizeof resolved_esc);
+                int len;
+                if(rc==0 || rc==1)
+                    len = snprintf(buf, sizeof buf, "{\"type\":\"info\",\"msg\":\"loaded %s\"}", resolved_esc);
+                else
+                    len = snprintf(buf, sizeof buf, "{\"type\":\"error\",\"msg\":\"failed to load %s (rc=%d)\"}", resolved_esc, rc);
+                if(len > 0 && (size_t)len < sizeof buf) send_frame_json(fd, buf, (size_t)len);
             }
 
         } else if(strncmp(cmd,"unload ",7)==0){
-            char name[128]; strncpy(name, cmd+7, sizeof name-1); name[sizeof name-1]='\0';
+            char name[256]; snprintf(name,sizeof name,"%s",cmd+7);
             int rc = unload_plugin_by_name(name);
-            if(rc<0) log_msg(LOG_WARN, "unload: %s not found", name);
+            char buf[POC_MAX_JSON], name_esc[256];
+            ph_json_escape_string(name,name_esc,sizeof name_esc);
+            if(rc<0){
+                log_msg(LOG_WARN, "unload: %s not found", name);
+                int len = snprintf(buf, sizeof buf, "{\"type\":\"error\",\"msg\":\"addon not loaded: %s\"}", name_esc);
+                if(len > 0 && (size_t)len < sizeof buf) send_frame_json(fd, buf, (size_t)len);
+            } else {
+                int len = snprintf(buf, sizeof buf, "{\"type\":\"info\",\"msg\":\"unloaded %s\"}", name_esc);
+                if(len > 0 && (size_t)len < sizeof buf) send_frame_json(fd, buf, (size_t)len);
+            }
 
         } else if(strcmp(cmd,"exit")==0){
             g_run = 0;
@@ -320,20 +419,30 @@ static void handle_msg(int fd, const char *js, int *fds, size_t nfds){
 /* ========= JSON list helper ========= */
 
 static void json_send_kv_list(int fd, const char *type, const char *key, char **items, int n){
-    char buf[POC_MAX_JSON]; size_t pos=0;
-    pos += snprintf(buf+pos, sizeof buf - pos, "{\"type\":\"%s\",\"%s\":[", type, key);
+    char buf[POC_MAX_JSON]; size_t pos=0; int w;
+    w = snprintf(buf, sizeof buf, "{\"type\":\"%s\",\"%s\":[", type, key);
+    if(w < 0 || (size_t)w >= sizeof buf) return;
+    pos = (size_t)w;
     for(int i=0;i<n;i++){
+        char esc[512];
+        ph_json_escape_string(items[i], esc, sizeof esc);
         const char *comma = (i+1<n)?",":"";
-        pos += snprintf(buf+pos, sizeof buf - pos, "\"%s\"%s", items[i], comma);
+        w = snprintf(buf+pos, sizeof buf - pos, "\"%s\"%s", esc, comma);
+        if(w < 0 || (size_t)w >= sizeof buf - pos) break;
+        pos += (size_t)w;
     }
-    pos += snprintf(buf+pos, sizeof buf - pos, "]}");
+    if(pos + 2 < sizeof buf){ buf[pos++]=']'; buf[pos++]='}'; }
     send_frame_json(fd, buf, pos);
 }
 
 /* ========= Main ========= */
 
 int main(void){
-    signal(SIGINT, on_sigint);
+    signal(SIGINT,  on_sigint);
+    signal(SIGTERM, on_sigint);
+    signal(SIGSEGV, crash_handler);
+    signal(SIGABRT, crash_handler);
+    signal(SIGBUS,  crash_handler);
     feedtab_init(&g_feeds);
     plugtab_init(&g_plugins);
 
@@ -347,45 +456,61 @@ int main(void){
     /* autoload addons present */
     autoload_addons();
 
-    /* event loop */
-    int fds[1024]; size_t nfds = 0;
+    /* event loop — epoll-based, no FD_SETSIZE limit */
+    int epfd = epoll_create1(EPOLL_CLOEXEC);
+    if(epfd < 0){ log_msg(LOG_ERROR,"epoll_create1: %s", strerror(errno)); return 1; }
+
+    { struct epoll_event ev = {0}; ev.events = EPOLLIN; ev.data.fd = g_listen_fd;
+      epoll_ctl(epfd, EPOLL_CTL_ADD, g_listen_fd, &ev); }
+
+    struct epoll_event evbuf[64];
     for(;;){
         if(!g_run) break;
-        fd_set r;
-        FD_ZERO(&r);
-        FD_SET(g_listen_fd, &r);
-        int maxfd = g_listen_fd;
-        for(size_t i=0;i<nfds;i++){ FD_SET(fds[i], &r); if(fds[i]>maxfd) maxfd=fds[i]; }
-        struct timeval tv = { .tv_sec=0, .tv_usec=200000 };
-        int rc = select(maxfd+1, &r, NULL, NULL, &tv);
-        if(rc < 0){ if(errno==EINTR) continue; log_msg(LOG_ERROR,"select: %s", strerror(errno)); break; }
+        int nr = epoll_wait(epfd, evbuf, 64, 200);
+        if(nr < 0){ if(errno==EINTR) continue; log_msg(LOG_ERROR,"epoll_wait: %s", strerror(errno)); break; }
 
-        if(FD_ISSET(g_listen_fd, &r)){
-            int cfd = accept(g_listen_fd, NULL, NULL);
-            if(cfd>=0){ set_nonblock(cfd); fds[nfds++] = cfd; log_msg(LOG_INFO,"client connected fd=%d", cfd); }
-        }
+        for(int ei = 0; ei < nr; ei++){
+            int fd = evbuf[ei].data.fd;
 
-        for(size_t i=0;i<nfds;){
-            int fd = fds[i];
-            if(FD_ISSET(fd, &r)){
+            if(fd == g_listen_fd){
+                int cfd = accept(g_listen_fd, NULL, NULL);
+                if(cfd >= 0){
+                    if(g_client_count >= PH_MAX_CLIENTS){
+                        log_msg(LOG_WARN, "client limit %d reached, rejecting fd=%d", PH_MAX_CLIENTS, cfd);
+                        close(cfd);
+                    } else {
+                        set_nonblock(cfd);
+                        struct epoll_event cev = {0};
+                        cev.events = EPOLLIN;
+                        cev.data.fd = cfd;
+                        if(epoll_ctl(epfd, EPOLL_CTL_ADD, cfd, &cev) < 0){
+                            log_msg(LOG_ERROR,"epoll_ctl add: %s", strerror(errno));
+                            close(cfd);
+                        } else {
+                            g_client_count++;
+                            log_msg(LOG_INFO,"client connected fd=%d (total=%d)", cfd, g_client_count);
+                        }
+                    }
+                }
+            } else {
                 char js[POC_MAX_JSON];
                 int ancfds[16];
                 size_t anccnt = sizeof(ancfds)/sizeof(ancfds[0]);
                 int got = recv_frame_json_with_fds(fd, js, sizeof js-1, ancfds, &anccnt, 10);
                 if(got <= 0){
-                    log_msg(LOG_INFO, "client fd=%d disconnected", fd);
+                    g_client_count--;
+                    log_msg(LOG_INFO,"client fd=%d disconnected (total=%d)", fd, g_client_count);
                     feedtab_unsub_all_fd(&g_feeds, fd);
+                    epoll_ctl(epfd, EPOLL_CTL_DEL, fd, NULL);
                     close(fd);
-                    for(size_t k=i+1;k<nfds;k++) fds[k-1]=fds[k];
-                    nfds--; continue;
                 } else {
                     handle_msg(fd, js, ancfds, anccnt);
-                    for(size_t k=0;k<anccnt;k++){ if(ancfds[k]>=0) close(ancfds[k]); }
+                    for(size_t k = 0; k < anccnt; k++) if(ancfds[k] >= 0) close(ancfds[k]);
                 }
             }
-            i++;
         }
     }
+    close(epfd);
 
     printf ("\t(8D)\n");
     log_msg(LOG_INFO, "core shutting down...");

@@ -33,6 +33,7 @@ int  feedtab_find(feedtab_t *t, const char *name);
 int  feedtab_ensure(feedtab_t *t, const char *name);
 void feedtab_sub(feedtab_t *t, const char *name, int fd);
 void feedtab_unsub_all_fd(feedtab_t *t, int fd);
+void feedtab_unsub(feedtab_t *t, const char *name, int fd);
 void feedtab_list(feedtab_t *t, int fd);
 
 // JSON tiny helpers

@@ -1,9 +1,11 @@
 
 #include "ph_uds_protocol.h"
+#include "common.h"
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
 #include <signal.h>
+#include <poll.h>
 
 static void usage(void){
     fprintf(stderr, "ph-cli usage:\n");
@@ -17,16 +19,7 @@ static void usage(void){
 }
 
 static int extract_feed(const char *js, char *out, size_t cap){
-    const char *p = strstr(js, "\"feed\":\"");
-    if(!p) return -1;
-    p += 8;
-    const char *q = strchr(p, '"');
-    if(!q) return -1;
-    size_t n = (size_t)(q - p);
-    if(n >= cap) n = cap - 1;
-    memcpy(out, p, n);
-    out[n] = '\0';
-    return 0;
+    return json_get_string(js, "feed", out, cap);
 }
 
 int main(int argc, char **argv){
@@ -34,25 +27,45 @@ int main(int argc, char **argv){
     int fd = uds_connect(PH_SOCK_PATH);
     if(fd<0){ perror("connect"); return 1; }
     char buf[POC_MAX_JSON];
+    int wait_for_response = 1;
+    int wait_for_publish_ack = 0;
 
     if(strcmp(argv[1],"help")==0){
         usage(); close(fd); return 0;
     } else if(strcmp(argv[1],"cmd")==0 && argc>=3){
-        snprintf(buf, sizeof buf, "{\"type\":\"command\",\"feed\":\"cli-control\",\"data\":\"%s\"}", argv[2]);
-        send_frame_json(fd, buf, strlen(buf));
+        char esc[POC_MAX_JSON/2];
+        ph_json_escape_string(argv[2], esc, sizeof esc);
+        snprintf(buf, sizeof buf, "{\"type\":\"command\",\"feed\":\"cli-control\",\"data\":\"%s\"}", esc);
+        if(send_frame_json(fd, buf, strlen(buf)) < 0){ perror("send"); close(fd); return 1; }
     } else if(strcmp(argv[1],"pub")==0 && argc>=4){
-        snprintf(buf, sizeof buf, "{\"type\":\"publish\",\"feed\":\"%s\",\"data\":\"%s\",\"encoding\":\"utf8\"}", argv[2], argv[3]);
-        send_frame_json(fd, buf, strlen(buf));
+        char feed[POC_MAX_FEED*2], data[POC_MAX_JSON/2];
+        ph_json_escape_string(argv[2], feed, sizeof feed);
+        ph_json_escape_string(argv[3], data, sizeof data);
+        snprintf(buf, sizeof buf, "{\"type\":\"publish\",\"feed\":\"%s\",\"data\":\"%s\",\"encoding\":\"utf8\",\"ack\":true}", feed, data);
+        if(send_frame_json(fd, buf, strlen(buf)) < 0){ perror("send"); close(fd); return 1; }
+        wait_for_publish_ack = 1;
     } else if(strcmp(argv[1],"sub")==0 && argc>=3){
         for(int i=2;i<argc;i++){
-            snprintf(buf, sizeof buf, "{\"type\":\"subscribe\",\"feed\":\"%s\"}", argv[i]);
-            send_frame_json(fd, buf, strlen(buf));
+            char feed[POC_MAX_FEED*2];
+            ph_json_escape_string(argv[i], feed, sizeof feed);
+            snprintf(buf, sizeof buf, "{\"type\":\"subscribe\",\"feed\":\"%s\"}", feed);
+            if(send_frame_json(fd, buf, strlen(buf)) < 0){ perror("send"); close(fd); return 1; }
         }
         fprintf(stderr, "[ph-cli] subscribed to %d feed(s). Ctrl+C to stop.\n", argc-2);
         while(1){
             char js[POC_MAX_JSON];
             int got = recv_frame_json(fd, js, sizeof js, 2000);
-            if(got<=0) continue;
+            if(got <= 0){
+                /* recv_frame_json returns -1 on both timeout and real disconnect.
+                 * Use poll(POLLHUP) to tell them apart: exit only on actual EOF. */
+                struct pollfd pfd = { .fd = fd, .events = 0 };
+                poll(&pfd, 1, 0);
+                if(pfd.revents & POLLHUP){
+                    fprintf(stderr, "[ph-cli] server disconnected, exiting\n");
+                    break;
+                }
+                continue; /* silence — broker alive, keep listening */
+            }
             char tag[128];
             if(extract_feed(js, tag, sizeof tag)==0)
                 fprintf(stdout, "[%s] %s\n", tag, js);
@@ -70,18 +83,38 @@ int main(int argc, char **argv){
         snprintf(buf,sizeof buf,"{\"type\":\"command\",\"feed\":\"cli-control\",\"data\":\"available-addons\"}");
         send_frame_json(fd, buf, strlen(buf));
     } else if(strcmp(argv[1],"load")==0 && argc>=4 && strcmp(argv[2],"addon")==0){
-        char joined[512]; joined[0]=0;
-        for(int i=3;i<argc;i++){ if(i>3) strcat(joined," "); strcat(joined,argv[i]); }
-        snprintf(buf,sizeof buf,"{\"type\":\"command\",\"feed\":\"cli-control\",\"data\":\"load %s\"}", joined);
-        send_frame_json(fd, buf, strlen(buf));
+        char joined[512]; size_t pos=0; joined[0]=0;
+        for(int i=3;i<argc;i++){
+            int n=snprintf(joined+pos,sizeof joined-pos,"%s%s",i>3?" ":"",argv[i]);
+            if(n<0 || (size_t)n>=sizeof joined-pos){ fprintf(stderr,"addon path too long\n"); close(fd); return 1; }
+            pos+=(size_t)n;
+        }
+        char esc[1024]; ph_json_escape_string(joined,esc,sizeof esc);
+        snprintf(buf,sizeof buf,"{\"type\":\"command\",\"feed\":\"cli-control\",\"data\":\"load %s\"}", esc);
+        if(send_frame_json(fd, buf, strlen(buf)) < 0){ perror("send"); close(fd); return 1; }
     } else if(strcmp(argv[1],"unload")==0 && argc>=4 && strcmp(argv[2],"addon")==0){
-        snprintf(buf,sizeof buf,"{\"type\":\"command\",\"feed\":\"cli-control\",\"data\":\"unload %s\"}", argv[3]);
-        send_frame_json(fd, buf, strlen(buf));
+        char esc[256]; ph_json_escape_string(argv[3],esc,sizeof esc);
+        snprintf(buf,sizeof buf,"{\"type\":\"command\",\"feed\":\"cli-control\",\"data\":\"unload %s\"}", esc);
+        if(send_frame_json(fd, buf, strlen(buf)) < 0){ perror("send"); close(fd); return 1; }
     } else {
         usage(); close(fd); return 1;
     }
 
-    // Print responses until timeout (~1.5s window)
+    if(!wait_for_response){ close(fd); return 0; }
+
+    if(wait_for_publish_ack){
+        char js[POC_MAX_JSON], type[32];
+        int got = recv_frame_json(fd, js, sizeof js, 1500);
+        if(got <= 0){ fprintf(stderr,"publish acknowledgement timed out\n"); close(fd); return 1; }
+        if(json_get_type(js,type,sizeof type)<0 || strcmp(type,"ack")!=0){
+            fprintf(stderr,"unexpected publish response: %s\n",js);
+            close(fd); return 1;
+        }
+        close(fd);
+        return 0;
+    }
+
+    // Print direct broker responses until timeout (~1.5s window)
     char js[POC_MAX_JSON];
     int printed = 0;
     while(1){

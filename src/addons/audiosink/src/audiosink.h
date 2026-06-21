@@ -5,6 +5,7 @@
 #include <stdint.h>
 #include <stddef.h>
 #include "ph_stream.h"
+#include "ph_ring.h"
 
 /* Runtime state for audiosink */
 typedef struct {
@@ -33,6 +34,11 @@ typedef struct {
     _Atomic bool cmd_run;
     pthread_t   th_play;
     pthread_t   th_cmd;
+
+    /* local consumer cursor + telemetry */
+    ph_ring_consumer_t consumer;
+    uint64_t underrun_events;
+    uint64_t xrun_events;
 
     /* misc */
     _Atomic bool started;

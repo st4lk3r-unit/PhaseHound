@@ -1,50 +1,59 @@
-# PhaseHound — Developer Docs
+# PhaseHound developer documentation
 
-PhaseHound is a small, embeddable broker for wiring add‑ons together via a local **Unix domain socket (UDS)** control plane and an optional **shared‑memory (SHM)** data plane. It uses a tiny framed JSON protocol and a plugin ABI so add‑ons can be built as `.so` libraries.
+PhaseHound is a local plugin runtime for explicit SDR processing graphs. Its Unix-domain socket carries control messages and shared-memory descriptors; continuous IQ/audio payloads remain in SHM rings.
 
-This documentation set explains:
-- how the core works,
-- the wire protocol,
-- shared memory patterns (why and how),
-- how to author add‑ons correctly,
-- how to build and debug, and
-- recommended conventions and best practices for SDR‑style workloads.
-
-> **Context:** PhaseHound targets high‑throughput SDR pipelines. Use **UDS for control**, **SHM for bulk IQ data** or other large payloads. FD passing (SCM_RIGHTS) is supported out of the box.
-
-## Quick Start
+## Quick start
 
 ```bash
-# Build core, CLI and bundled add‑ons
-make && make addons
+# Builds ph-core, ph-cli, and bundled addons.
+make -j"$(nproc)"
 
-# Start the core in one terminal
+# Run from the repository root so addon autoload finds src/addons/*/ph-lib*.so.
 ./ph-core
 
-# In another terminal, interact via CLI (examples)
-./ph-cli help
+# Inspect the runtime from another terminal.
+./ph-cli list addons
 ./ph-cli list feeds
 ./ph-cli available-addons
 ```
 
-See **CLI.md** for a full tour and **ADDON_DEVELOPMENT.md** to write your first add‑on.
+Defaults:
 
----
+- Control socket: `/tmp/.PhaseHound-broker.sock`
+- Plugin ABI: `1.0`
+- Maximum feed name: 64 bytes
+- Maximum JSON frame: 65536 bytes
 
-- **Default socket:** `/tmp/.PhaseHound-broker.sock`
-- **Plugin ABI:** `1`
-- **Max feed name:** 64 bytes
-- **Max JSON frame:** 65536 bytes
+## Documentation map
 
-## Repo Layout
+- [`ARCHITECTURE.md`](ARCHITECTURE.md) — broker, feed, addon, and SHM architecture.
+- [`BUILDING.md`](BUILDING.md) — dependencies, build modes, and artifacts.
+- [`CLI.md`](CLI.md) — CLI commands, reply behavior, and graph wiring.
+- [`PROTOCOL.md`](PROTOCOL.md) — framed JSON protocol and fd passing.
+- [`SHM_GUIDE.md`](SHM_GUIDE.md) — ring ownership, local cursors, and fan-out.
+- [`REALTIME.md`](REALTIME.md) — timestamp model, counters, and threading.
+- [`FILE_IO.md`](FILE_IO.md) — raw/`phcap` replay and raw/`phcap`/WAV capture.
+- [`ADDON_DEVELOPMENT.md`](ADDON_DEVELOPMENT.md) — normalized addon ABI and examples.
+- [`TROUBLESHOOTING.md`](TROUBLESHOOTING.md) — operational failures and diagnostics.
+- [`SECURITY.md`](SECURITY.md) — local socket and plugin trust boundaries.
+- [`ROADMAP.md`](ROADMAP.md) — completed hardening and remaining work.
 
+## Repository layout
+
+```text
+include/                 public ABI, ring, timestamp, and file-format headers
+src/core.c               broker and addon loader
+src/common/              shared control/SHM/ring helpers
+src/dsp/                 shared DSP primitives
+src/addons/              bundled addons
+  soapy/                 live IQ source
+  filesource/            raw/phcap replay source
+  wfmd/                  wide-FM demodulator
+  audiosink/             ALSA PCM sink
+  filesink/              IQ/audio capture sink
+  lorad/                 LoRa CSS preamble detector and raw symbol demodulator
+  dummy/                 reference addon
+tools/cli.c              ph-cli
+tools/waterfall.c        ph-waterfall — OpenGL 3.3 waterfall+spectrum viewer (make waterfall)
+wfmd-*.sh                live/replay convenience workflows
 ```
-/
-  include/          # headers: protocol, plugin ABI, helpers
-  src/              # core + common helpers
-    addons/         # sample add‑ons (soapy, wfmd, audiosink, dummy)
-  tools/            # ph-cli
-  Makefile          # top-level build (core + cli + addons)
-```
-
-See **ARCHITECTURE.md** and **PROTOCOL.md** for internals.

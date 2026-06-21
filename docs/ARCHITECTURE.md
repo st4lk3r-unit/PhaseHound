@@ -1,44 +1,65 @@
 # Architecture
 
-PhaseHound consists of:
+PhaseHound has three runtime roles:
 
-1. **Core broker (`ph-core`)** — accepts UDS clients, routes messages by *feed*.
-2. **CLI (`ph-cli`)** — a convenience client for publishing commands and inspecting state.
-3. **Add‑ons** — shared libraries (`.so`) loaded by the core (autoload or on command) that connect back to the broker to publish/subscribe and exchange metadata.
+1. `ph-core` accepts local clients, owns feed subscriptions, routes framed JSON, and loads native addons.
+2. `ph-cli` sends broker commands or addon control text and can monitor feeds.
+3. Addons connect back to the broker and exchange control messages plus SHM descriptors.
 
+```text
+                 framed JSON + optional SCM_RIGHTS
++---------+      over Unix-domain socket       +---------+
+| addon A | <---------------------------------> | ph-core |
++----+----+                                      +----+----+
+     |                                                ^
+     | shared-memory sample ring                      |
+     v                                                |
++----+----+                                           |
+| addon B | <-----------------------------------------+
++---------+
 ```
-+-----------+         UDS JSON frames            +-----------+
-|  Add-on A |  <------------------------------>  |  ph-core  |
-+-----------+                                     +-----------+
-      |                                                 ^
-      v                                                 |
-+-----------+                                           |
-|  Add-on B |  <----------------------------------------+
-+-----------+
 
-Large buffers: SHM fd passed once via UDS (SCM_RIGHTS) + small JSON metadata.
+## Control plane
+
+- Socket: `/tmp/.PhaseHound-broker.sock`
+- Framing: `[u32 big-endian length][JSON bytes]`
+- Routing: a publication names a feed and is forwarded unchanged to current subscribers
+- Disconnect handling: all subscriptions owned by the disconnected fd are removed
+- Core event loop: `epoll`, avoiding the `FD_SETSIZE` limitation of `select()`
+
+The broker is intentionally stateless with respect to the latest feed value. It does not replay a prior SHM descriptor to late subscribers.
+
+## Data plane
+
+IQ and audio use shared-memory ring fds passed with `SCM_RIGHTS`. The broker forwards the descriptor but never maps or copies the sample payload.
+
+Producers own absolute write cursors. Consumers map the same ring and maintain independent local read cursors, allowing fan-out to several DSP stages or sinks.
+
+## Addons
+
+An addon exports:
+
+```c
+const char *plugin_name(void);
+bool plugin_init(const plugin_ctx_t *, plugin_caps_t *);
+bool plugin_start(void);
+void plugin_stop(void);
 ```
 
-## Control Plane
+At startup the core scans:
 
-- **Transport:** Unix domain socket at `/tmp/.PhaseHound-broker.sock` (compile-time macro `PH_SOCK_PATH`).
-- **Framing:** `[u32 length BE][JSON payload]`.
-- **Routing:** Each JSON event names a `feed`; subscribers to that feed receive the event unchanged.
-- **Core loop:** `select()` over the listen socket and all client fds; on disconnect, subscriptions from that fd are removed.
+```text
+./src/addons
+./addons
+./
+```
 
-## Data Plane (for SDR payloads)
+It loads readable `.so` files, verifies required symbols and capability size, calls `plugin_init()`, then `plugin_start()`. `unload` calls `plugin_stop()` before `dlclose()`.
 
-- UDS is kept small and predictable (control messages).
-- For high-rate IQ or wideband payloads, allocate a **shared-memory** region and **pass the fd once** using `SCM_RIGHTS`.
-- The sample `dummy` add‑on demonstrates `memfd_create`/`shm_open` fallback and publishes a small JSON descriptor alongside the passed fd.
+Addons normally establish their own broker connection and advertise control/data feeds. Dynamic topology is configured with usage-tagged subscriptions rather than direct addon-to-addon calls.
 
-## Plugins (Add‑ons)
+## Ring and timestamp ABI
 
-- Shared libraries with four exported functions:
-  - `const char* plugin_name(void);`
-  - `bool plugin_init(const plugin_ctx_t*, plugin_caps_t* out_caps);`
-  - `bool plugin_start(void);`
-  - `void plugin_stop(void);`
-- The core loads them (autoload on startup or via CLI `load addon <name>`), fills a `plugin_ctx_t` (ABI major/minor plus broker socket path) and passes it to `plugin_init`, then `start` (typically spawns a thread), and later `stop`.
-- See **ADDON_DEVELOPMENT.md** for the full guide.
+`include/ph_stream.h` defines v0 IQ/audio headers. Their sample `data[]` offsets remain stable. The existing `reserved[64]` region can carry `ph_ring_meta_v0_t`, including latest timestamp and producer telemetry, without changing the ring payload ABI.
 
+See `SHM_GUIDE.md`, `REALTIME.md`, and `ADDON_DEVELOPMENT.md` for ownership and lifecycle details.

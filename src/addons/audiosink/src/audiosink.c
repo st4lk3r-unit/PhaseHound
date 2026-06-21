@@ -16,6 +16,7 @@
 
 /* --- addon globals --- */
 static audiosink_t S;
+static ph_ctrl_t   g_ctrl;
 static const char *g_sock = NULL;
 
 static int audiosink_subscribe_cb(void *user, const char *usage, const char *feed) {
@@ -58,17 +59,25 @@ static int audiosink_unsubscribe_cb(void *user, const char *usage) {
 /* ---- playback thread ---- */
 static void *play_thread(void *arg){
     (void)arg;
-    float framebuf[2048];
+    float framebuf[1024];
 
     while(atomic_load(&S.play_run)){
         if(!S.hdr || !S.pcm){ ph_msleep(5); continue; }
 
-        size_t nframes = au_ring_pop_f32(&S, framebuf, sizeof(framebuf)/sizeof(framebuf[0]));
-        if(nframes == 0){ ph_msleep(2); continue; }
+        unsigned ch = S.hdr->channels ? S.hdr->channels : 1u;
+        size_t max_frames = (sizeof(framebuf)/sizeof(framebuf[0])) / ch;
+        size_t nframes = au_ring_pop_f32(&S, framebuf, max_frames);
+        if(nframes == 0){
+            S.underrun_events++;
+            /* Feed silence to ALSA rather than sleeping; prevents XRUN when the
+             * audio ring stalls briefly (e.g., during wfmd DSP batch or USB gap). */
+            memset(framebuf, 0, max_frames * ch * sizeof(float));
+            nframes = max_frames;
+        }
 
         snd_pcm_sframes_t wrote = snd_pcm_writei(S.pcm, framebuf, nframes);
         if(wrote < 0){
-            if(wrote == -EPIPE){ snd_pcm_prepare(S.pcm); continue; }
+            if(wrote == -EPIPE){ S.xrun_events++; snd_pcm_prepare(S.pcm); continue; }
             if(wrote == -ESTRPIPE){
                 while((wrote = snd_pcm_resume(S.pcm)) == -EAGAIN) ph_msleep(1);
                 if(wrote < 0) snd_pcm_prepare(S.pcm);
@@ -136,9 +145,21 @@ static void on_cmd(ph_ctrl_t *c, const char *line, void *u){
     }
     if(strcmp(line,"status")==0){
         char js[256];
+        uint64_t w = S.hdr ? atomic_load(&S.hdr->wpos) : 0;
+        uint64_t lag_bytes = (S.hdr && w >= S.consumer.rpos) ? (w - S.consumer.rpos) : 0;
+        double lag_ms = 0.0;
+        if (S.hdr && S.hdr->sample_rate > 0.0 && S.hdr->bytes_per_samp && S.hdr->channels) {
+            double frame_bytes = (double)S.hdr->bytes_per_samp * (double)S.hdr->channels;
+            lag_ms = 1000.0 * ((double)lag_bytes / frame_bytes) / S.hdr->sample_rate;
+        }
         snprintf(js,sizeof js,
-            "{\"ok\":true,\"pcm\":%s,\"feed\":\"%s\"}",
-            S.pcm?"true":"false", S.current_feed[0]?S.current_feed:"");
+            "{\"ok\":true,\"pcm\":%s,\"feed\":\"%s\",\"lag_ms\":%.3f,"
+            "\"lost_bytes\":%llu,\"overrun_events\":%llu,\"underruns\":%llu,\"xruns\":%llu}",
+            S.pcm?"true":"false", S.current_feed[0]?S.current_feed:"", lag_ms,
+            (unsigned long long)S.consumer.lost_bytes,
+            (unsigned long long)S.consumer.overrun_events,
+            (unsigned long long)S.underrun_events,
+            (unsigned long long)S.xrun_events);
         ph_reply(c, js);
         return;
     }
@@ -153,6 +174,7 @@ static void *cmd_thread(void *arg){
     if(fd < 0) return NULL;
 
     S.fd = fd;
+    ph_ctrl_init(&g_ctrl, fd, "audiosink");
     /* advertise control feeds */
     ph_create_feed(fd, "audiosink.config.in");
     ph_create_feed(fd, "audiosink.config.out");
@@ -170,8 +192,7 @@ static void *cmd_thread(void *arg){
         if(n <= 0) continue;
 
         /* 1) Let shared dispatcher consume config commands (accepts publish/command) */
-        if(ph_ctrl_dispatch((ph_ctrl_t*)&(ph_ctrl_t){ .fd=fd, .name="audiosink",
-            .feed_in="audiosink.config.in", .feed_out="audiosink.config.out" }, js, (size_t)n, on_cmd, NULL)){
+        if(ph_ctrl_dispatch(&g_ctrl, js, (size_t)n, on_cmd, NULL)){
             if(infd>=0) close(infd);
             continue;
         }
@@ -214,7 +235,7 @@ bool plugin_init(const plugin_ctx_t *ctx, plugin_caps_t *out){
 
     if(out){
         out->caps_size = sizeof(*out);
-        out->name=plugin_name(); out->version="0.4.0";
+        out->name=plugin_name(); out->version="0.4.1";
         out->consumes=CONS;    out->produces=PROD;
         out->feat_bits = PH_FEAT_PCM;
     }
