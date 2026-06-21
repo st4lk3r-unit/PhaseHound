@@ -21,7 +21,7 @@
 Addon acknowledgements and validation errors are published on `<addon>.config.out`, so inspect them with another CLI process:
 
 ```bash
-./ph-cli sub soapy.config.out wfmd.config.out filesink.config.out
+./ph-cli sub soapy.config.out wfmd.config.out filesink.config.out lorad.config.out
 ```
 
 ## Addon control
@@ -47,6 +47,7 @@ Common usage labels:
 
 ```text
 wfmd:      iq-source
+lorad:     iq-source
 filesink:  iq-source, pcm-source (audio-source alias)
 audiosink: pcm-source (pcm/audio-source aliases)
 soapy:     monitor
@@ -83,6 +84,17 @@ Use `open` to republish an existing descriptor to a late subscriber:
 ./ph-cli pub soapy.config.in "open"
 ./ph-cli pub wfmd.config.in "open"
 ./ph-cli pub filesource.config.in "open"
+```
+
+## LoRa graph
+
+```bash
+./ph-cli pub lorad.config.in "subscribe iq-source soapy.IQ-info"
+./ph-cli pub lorad.config.in "sf 7"
+./ph-cli pub lorad.config.in "bw 125000"
+./ph-cli pub lorad.config.in "output-path /tmp/lora.hex"
+./ph-cli pub lorad.config.in "start"
+./ph-cli sub lorad.packets
 ```
 
 ## File graph

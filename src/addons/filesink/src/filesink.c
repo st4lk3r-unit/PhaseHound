@@ -151,7 +151,7 @@ static int target_open_outputs_locked(sink_target_t *t){
     if(!t || !t->path[0]){ errno = EINVAL; return -1; }
     if(t->out) return 0;
     if(target_fmt(t) == FMT_WAV && t->want_kind != PH_STREAM_KIND_AUDIO){ errno = EINVAL; return -1; }
-    if(S.append && target_fmt(t) != FMT_RAW){ errno = EINVAL; return -1; }
+    if(S.append && target_fmt(t) != FMT_RAW && target_fmt(t) != FMT_HEX){ errno = EINVAL; return -1; }
     t->out = fopen(t->path, S.append ? "ab" : "wb");
     if(!t->out) return -1;
     setvbuf(t->out, NULL, _IOFBF, 1024*1024);
@@ -507,7 +507,7 @@ static void on_cmd(ph_ctrl_t *c, const char *line, void *user){
         }
         pthread_mutex_unlock(&S.mu);
         if(err){
-            if(err==EINVAL) ph_reply_err(c,"invalid format combination: WAV is audio-only and append is raw-only");
+            if(err==EINVAL) ph_reply_err(c,"invalid format combination: WAV is audio-only and append is raw/hex only");
             else ph_reply_errf(c,"open failed: %s", strerror(err));
             return;
         }

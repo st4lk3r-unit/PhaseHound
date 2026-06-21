@@ -20,6 +20,7 @@ RF/file source -> DSP or decoder -> audio/file/event sink
 - Reserved-header telemetry and normalized timestamps.
 - SoapySDR IQ source with hardware timestamps when available.
 - Wide-FM demodulator with a separate control and DSP thread.
+- LoRa CSS preamble detector and raw symbol demodulator (`lorad`), with hex file output.
 - ALSA audio sink.
 - Raw/`phcap` file replay and raw/`phcap`/WAV capture.
 - Simultaneous IQ and demodulated-audio capture with independent cursors.
@@ -96,8 +97,7 @@ On Ubuntu/Debian:
 
 ```bash
 sudo apt install build-essential pkg-config libsoapysdr-dev libasound2-dev libglfw3-dev
-make -j"$(nproc)"          # builds core, CLI, and all addons
-make waterfall             # optional: builds ph-waterfall (requires GLFW)
+make -j"$(nproc)"          # builds core, CLI, all addons, and ph-waterfall if GLFW is present
 ```
 
 The top-level `make` builds the core, CLI, and every bundled addon. Optional addons are skipped when their development package is absent. Use this in CI or release builds to require all optional backends:
@@ -218,6 +218,44 @@ Keys:
 The window title updates ~10 Hz with the frequency and power level under the cursor.
 The convenience scripts launch the viewer automatically when the binary is present.
 
+## LoRa demodulator
+
+`lorad` is a LoRa CSS preamble detector and raw symbol demodulator. It consumes an IQ ring,
+channelizes and dechirps the signal, detects preambles (8 upchirps), skips the SFD, and
+Gray-decodes data symbols into raw byte packets. No FEC or de-interleaving.
+
+```bash
+# Wire IQ source (tune SDR to LoRa channel centre first)
+./ph-cli pub lorad.config.in "subscribe iq-source soapy.IQ-info"
+
+# LoRa parameters (SF7, 125 kHz is a common default)
+./ph-cli pub lorad.config.in "sf 7"
+./ph-cli pub lorad.config.in "bw 125000"
+./ph-cli pub lorad.config.in "foff 0"       # Hz offset within the IQ band if needed
+
+# Write decoded packets as hex lines to a file (one packet per line)
+./ph-cli pub lorad.config.in "output-path /tmp/lora-frames.hex"
+
+# Start demodulating
+./ph-cli pub lorad.config.in "start"
+
+# Monitor packets live on the control plane simultaneously
+./ph-cli sub lorad.packets
+```
+
+Close the output file without stopping:
+
+```bash
+./ph-cli pub lorad.config.in "output-close"
+```
+
+Append to an existing file instead of overwriting:
+
+```bash
+./ph-cli pub lorad.config.in "output-append 1"
+./ph-cli pub lorad.config.in "output-path /tmp/lora-frames.hex"
+```
+
 ## File replay and capture
 
 `filesink` can capture IQ and audio simultaneously:
@@ -280,6 +318,7 @@ Implemented now:
 - normalized usage-tagged routing,
 - IQ/audio SHM rings with multi-consumer cursors,
 - live Soapy -> WFMD -> ALSA pipeline,
+- LoRa CSS demod with hex file output,
 - file source/sink, dual capture, WAV output, and `phcap` replay,
 - timestamp propagation and real-time status counters,
 - ordered broker dispatch acknowledgements and partial-I/O-safe framed transport,

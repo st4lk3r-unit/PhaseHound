@@ -19,7 +19,8 @@
 - partial-I/O-safe framed UDS and `SCM_RIGHTS` transport,
 - escaped control JSON round-trip handling,
 - GitHub Actions release bundle generation,
-- OpenGL 3.3 waterfall + spectrum viewer with inferno colourmap, auto-gain, and cursor frequency/dB readout.
+- OpenGL 3.3 waterfall + spectrum viewer with inferno colourmap, auto-gain, and cursor frequency/dB readout,
+- LoRa CSS preamble detector and raw symbol demodulator with hex file output (`lorad`).
 
 ## Near-term
 

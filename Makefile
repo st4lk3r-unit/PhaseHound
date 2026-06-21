@@ -25,10 +25,14 @@ WATERFALL_SRCS := tools/waterfall.c src/common.c src/dsp/ph_dsp.c \
                   src/common/ph_ring.c src/common/ph_shm.c
 WF_CFLAGS := $(shell pkg-config --cflags glfw3 2>/dev/null)
 WF_LIBS   := $(shell pkg-config --libs   glfw3 2>/dev/null) -lGL -lm
+HAS_GLFW  := $(shell pkg-config --exists glfw3 2>/dev/null && echo yes)
 
 .PHONY: all clean addons install waterfall
 
 all: $(CORE_BIN) $(CLI_BIN) addons
+ifeq ($(HAS_GLFW),yes)
+all: $(WATERFALL_BIN)
+endif
 
 $(CORE_BIN): $(CORE_OBJS)
 	$(CC) $(PH_CFLAGS) $(CFLAGS) $^ -o $@ $(LDFLAGS) $(PH_LDFLAGS)
@@ -51,10 +55,12 @@ clean:
 	  if [ -f $$d/Makefile ]; then echo "[addons] cleaning $$d"; $(MAKE) -C $$d clean; fi; \
 	done
 
-waterfall: $(WATERFALL_SRCS)
-	$(CC) $(PH_CFLAGS) $(CFLAGS) $(INCS) $(WF_CFLAGS) $(WATERFALL_SRCS) \
-	  -o $(WATERFALL_BIN) $(LDFLAGS) $(PH_LDFLAGS) $(WF_LIBS)
-	@echo "[waterfall] built $(WATERFALL_BIN)"
+$(WATERFALL_BIN): $(WATERFALL_SRCS)
+	$(CC) $(PH_CFLAGS) $(CFLAGS) $(INCS) $(WF_CFLAGS) $^ \
+	  -o $@ $(LDFLAGS) $(PH_LDFLAGS) $(WF_LIBS)
+	@echo "[waterfall] built $@"
+
+waterfall: $(WATERFALL_BIN)
 
 install:
 	install -m755 $(CORE_BIN) $(PREFIX)/bin/$(CORE_BIN)

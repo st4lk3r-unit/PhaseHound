@@ -2,8 +2,8 @@
 // Pipeline: IQ SHM ring → channelizer → dechirp+FFT → preamble sync → symbols → lorad.packets
 //
 // Basic CSS demod: preamble detect (8 upchirps), SFD skip, Gray-decoded symbol capture.
-// No Hamming FEC, no de-interleaving — raw symbol bytes output for pipeline demo.
-// Feeds into: filesink format=hex for "IQ → LoRa demod → hex file" demo pipeline.
+// No Hamming FEC, no de-interleaving — raw symbol bytes emitted as JSON on lorad.packets
+// and optionally written as one hex line per packet to a file (output-path command).
 
 #define _GNU_SOURCE
 #include <unistd.h>
@@ -54,6 +54,22 @@ static pthread_t    g_dsp_thr;
 static ph_ctrl_t    g_ctrl;
 static _Atomic bool g_ctrl_started = false;
 static _Atomic bool g_dsp_started  = false;
+
+/* ---- hex file output ---- */
+static char            g_out_path[512] = {0};
+static FILE           *g_out_fp        = NULL;
+static int             g_out_append    = 0;
+static pthread_mutex_t g_out_mu        = PTHREAD_MUTEX_INITIALIZER;
+
+static void out_close_locked(void) {
+    if (g_out_fp) { fclose(g_out_fp); g_out_fp = NULL; }
+}
+static int out_open_locked(void) {
+    out_close_locked();
+    if (!g_out_path[0]) return 0;
+    g_out_fp = fopen(g_out_path, g_out_append ? "ab" : "wb");
+    return g_out_fp ? 0 : -1;
+}
 
 /* ---- config atomics ---- */
 static _Atomic int    g_sf        = 7;      /* spreading factor 7..12 */
@@ -302,6 +318,11 @@ static void emit_packet(int sf, int bw, float snr_db) {
         hex[2*i+1]=hx[b&0xF];
     }
     hex[g_pkt_nsyms*2]='\0';
+
+    pthread_mutex_lock(&g_out_mu);
+    if (g_out_fp) { fputs(hex, g_out_fp); fputc('\n', g_out_fp); fflush(g_out_fp); }
+    pthread_mutex_unlock(&g_out_mu);
+
     char js[POC_MAX_JSON];
     int n = snprintf(js, sizeof js,
         "{\"type\":\"publish\","
@@ -470,8 +491,36 @@ static void on_cmd(ph_ctrl_t *c, const char *line, void *user) {
     if (strncmp(line,"help",4)==0) {
         ph_reply(c, "{\"ok\":true,\"help\":\"help|sf <7..12>|bw <125000|250000|500000>|"
                     "foff <Hz>|min_syms <n>|max_syms <n>|threshold <dB>|"
+                    "output-path <file>|output-append <0|1>|output-close|"
                     "subscribe iq-source <feed>|unsubscribe iq-source|"
                     "open|start|stop|status\"}");
+        return;
+    }
+    if (strncmp(line,"output-path ",12)==0) {
+        const char *v=line+12; while(*v==' '||*v=='\t') v++;
+        pthread_mutex_lock(&g_out_mu);
+        snprintf(g_out_path, sizeof g_out_path, "%s", v);
+        int r = out_open_locked();
+        pthread_mutex_unlock(&g_out_mu);
+        if (r!=0) { ph_reply_errf(c,"open failed: %s", strerror(errno)); return; }
+        ph_reply_okf(c,"output-path=%s append=%d", g_out_path, g_out_append);
+        return;
+    }
+    if (strncmp(line,"output-append ",14)==0) {
+        int v = atoi(line+14);
+        pthread_mutex_lock(&g_out_mu);
+        g_out_append = v ? 1 : 0;
+        if (g_out_path[0]) out_open_locked();
+        pthread_mutex_unlock(&g_out_mu);
+        ph_reply_okf(c,"output-append=%d", g_out_append);
+        return;
+    }
+    if (strncmp(line,"output-close",12)==0) {
+        pthread_mutex_lock(&g_out_mu);
+        out_close_locked();
+        g_out_path[0]='\0';
+        pthread_mutex_unlock(&g_out_mu);
+        ph_reply_ok(c,"output closed");
         return;
     }
     if (strncmp(line,"open",4)==0) {
@@ -636,5 +685,8 @@ void plugin_stop(void) {
     pthread_mutex_lock(&g_iq_mu);
     iq_ring_close(&g_iq);
     pthread_mutex_unlock(&g_iq_mu);
+    pthread_mutex_lock(&g_out_mu);
+    out_close_locked();
+    pthread_mutex_unlock(&g_out_mu);
     dsp_state_reset();
 }

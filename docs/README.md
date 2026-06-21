@@ -51,6 +51,7 @@ src/addons/              bundled addons
   wfmd/                  wide-FM demodulator
   audiosink/             ALSA PCM sink
   filesink/              IQ/audio capture sink
+  lorad/                 LoRa CSS preamble detector and raw symbol demodulator
   dummy/                 reference addon
 tools/cli.c              ph-cli
 tools/waterfall.c        ph-waterfall — OpenGL 3.3 waterfall+spectrum viewer (make waterfall)

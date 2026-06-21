@@ -29,7 +29,7 @@ make -j"$(nproc)"
 
 The default `all` target builds `ph-core`, `ph-cli`, and every addon directory containing a Makefile. A missing optional backend causes that addon to be skipped; actual compiler/linker failures still fail the build.
 
-Build the optional waterfall viewer (requires GLFW 3 and libGL):
+The waterfall viewer (`ph-waterfall`) is built automatically by `make` when `libglfw3-dev` is detected. To build it explicitly or in isolation:
 
 ```bash
 make waterfall
